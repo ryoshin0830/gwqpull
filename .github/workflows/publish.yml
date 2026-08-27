@@ -1,0 +1,113 @@
+name: publish
+
+# **Every** push to main ends with something published on npm. main's
+# package.json is the desired state, never merely a suggestion:
+#
+#   version already on the registry → CI bumps patch, commits that to main,
+#                                      publishes the new number
+#   version not yet on the registry  → published exactly as written, so
+#                                      `npm version minor` still lets you
+#                                      choose the number yourself
+#
+# The suite gates both paths; a red suite releases nothing.
+#
+# Publishing uses npm trusted publishing (OIDC): CI mints a short-lived token
+# per run, so no npm credential exists on a laptop or in this repository's
+# secrets. That matters here — CLAUDE.md refuses install scripts because of the
+# Shai-Hulud worm, and a long-lived publish token on disk is the other half of
+# that same attack. It is also what made every release need a browser and a
+# passkey.
+#
+# One-time setup per package, on npmjs.com → the package → Settings → Trusted
+# Publisher: GitHub Actions, owner `ryoshin0830`, this repository, workflow
+# filename `publish.yml`, allowed action `npm publish`.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # only so a version bump can be committed back to main
+  id-token: write # the OIDC token npm authenticates the publish with
+
+# Never let two runs publish at once. Not cancel-in-progress: killing a run
+# mid-publish is worse than making the next one wait.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: npm must be new enough for trusted publishing
+        run: |
+          have=$(npm --version)
+          printf '%s\n%s\n' 11.5.1 "$have" | sort -V -C \
+            || { echo "npm $have is older than the 11.5.1 trusted publishing needs"; exit 1; }
+          echo "npm $have"
+
+      # The suite skips any shell it cannot find and every interactive test when
+      # `expect` is missing, so without this step the release gate quietly stops
+      # checking --init and the whole naming flow.
+      - name: Install the shells and the pty the suite needs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh expect
+          # fish lives in universe; it is the one the suite can afford to skip.
+          sudo apt-get install -y fish || echo "fish unavailable — its --init test will skip"
+
+      # No `npm ci`: this package has zero dependencies (I12) and deliberately
+      # carries no lockfile, so there is nothing to install.
+      - run: npm test
+
+      # prepublishOnly runs the suite again plus `npm pack --dry-run` and
+      # --help. No NODE_AUTH_TOKEN — OIDC is the credential.
+      #
+      # The bump-back step is what makes "any case" literal: npm refuses a
+      # duplicate version, so a push whose version already shipped raises the
+      # patch itself rather than letting the run die or silently no-op. It is
+      # committed under the bot identity with [skip ci], or the push would wake
+      # this very workflow and chase its own tail. A race against main moving
+      # underneath loses nothing — the rebase retries once against the very
+      # serialization `concurrency` above usually makes moot.
+      - name: Publish — as written when new, +patch when already out
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+
+          # A package that has never been published 404s here; an unreachable
+          # registry fails here too. Both land on "publish as written", which is
+          # still safe: npm refuses a duplicate itself.
+          published=$(npm view "$name" versions --json 2>/dev/null || echo null)
+          if node -e '
+            const v = process.argv[1];
+            let list = [];
+            try { list = [].concat(JSON.parse(process.argv[2])); } catch (e) {}
+            process.exit(list.includes(v) ? 0 : 1);
+          ' "$version" "$published"; then
+            echo "$version is already out — bumping patch"
+            npm version patch --no-git-tag-version
+            version=$(node -p "require('./package.json').version")
+
+            git config user.name  'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add package.json
+            git commit -m "chore(release): ${version} [skip ci]"
+            git push origin HEAD:main \
+              || { git pull --rebase origin main && git push origin HEAD:main; }
+            echo "committed the bump to main"
+          else
+            echo "$version is new — publishing as written"
+          fi
+
+          echo "releasing ${name}@${version}"
+          npm publish

@@ -286,19 +286,37 @@ Cursor restore (`\x1b[?25h`) is guarded by `stderr.isTTY`.
 
 ```sh
 git add -A && git commit -m "feat: …"
-npm pack --dry-run          # must not contain .claude/, CLAUDE.md, test/, reference/
+npm pack --dry-run          # must not contain .claude/, CLAUDE.md, test/, .git/
 npm version patch           # or minor / major — commits and tags
-git push --follow-tags
-npm publish                 # prompts for passkey/OTP via the npm web auth flow
-npm view gwqpull version
+git push --follow-tags      # pushing main fires .github/workflows/publish.yml
+gh run watch                # optional; the publish happens in CI
 npx -y gwqpull@latest --version
 ```
 
-`prepublishOnly` runs `npm test && npm pack --dry-run && node bin/gwqpull.mjs --help`.
+**Do not run `npm publish` by hand.** **Every push to main releases.** CI runs
+the suite, then publishes whatever `package.json` says — raising patch itself,
+and committing that bump back to main, when the version there has already
+shipped. Bump manually first (`npm version minor`) to choose a number; forget,
+and you still shipped at +patch. Re-run a failure with
+`gh workflow run publish.yml` — there is nothing to undo and no tag to move.
 
-Publishing needs `registry.npmjs.org` credentials. If the machine's `.npmrc`
-points `registry=` at a private mirror, publish with
-`npm publish --registry=https://registry.npmjs.org`.
+Because every push releases, treat main as the publish button: docs fixes and
+test tweaks land as real versions. That is deliberate.
+
+Commit-message footgun: GitHub reads **every line** of a push's HEAD message,
+not just the subject, and skips the whole event when any of them carries a CI
+skip token. Never write the token in prose; say "the skip token" instead. The
+bot's own releases use it legitimately, which is why they never fan out.
+
+CI publishes with npm trusted publishing (OIDC): no npm token exists on any
+laptop or in this repository's secrets, and no release needs a browser or a
+passkey. One-time setup per package, on npmjs.com → the package → Settings →
+Trusted Publisher: GitHub Actions, owner `ryoshin0830`, repository `gwqpull`,
+workflow filename `publish.yml`, allowed action `npm publish`.
+
+The developer machine's `.npmrc` points `registry=` at a private mirror, so
+anything run locally against npmjs.org needs
+`--registry=https://registry.npmjs.org`. CI has no such mirror.
 
 ---
 
