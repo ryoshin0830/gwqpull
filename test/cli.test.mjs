@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, existsSync, readdirSync, realpathSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync, mkdirSync, existsSync, readdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 const BIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'gwqpull.mjs');
 const SLUG = 'github.com/alice/api';
 
-let sandbox, ghqRoot, wtBase, originDir, shimDir;
+let sandbox, ghqRoot, wtBase, originDir, shimDir, seedDir, prCommit1, prCommit2;
 
 const git = (cwd, ...args) => {
   const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -37,16 +37,36 @@ before(() => {
 
   // An origin with two branches: main, and feat/login — whose slash is the
   // reason a worktree directory name can never be trusted as a branch name.
-  const seed = join(sandbox, 'seed');
-  mkdirSync(seed);
-  git(seed, 'init', '-q', '-b', 'main');
-  git(seed, 'config', 'user.email', 'test@example.com');
-  git(seed, 'config', 'user.name', 'Test');
-  writeFileSync(join(seed, 'README.md'), '# api\n');
-  git(seed, 'add', '-A');
-  git(seed, 'commit', '-qm', 'init');
-  git(seed, 'branch', 'feat/login');
-  git(sandbox, 'clone', '-q', '--bare', seed, originDir);
+  seedDir = join(sandbox, 'seed');
+  mkdirSync(seedDir);
+  git(seedDir, 'init', '-q', '-b', 'main');
+  git(seedDir, 'config', 'user.email', 'test@example.com');
+  git(seedDir, 'config', 'user.name', 'Test');
+  writeFileSync(join(seedDir, 'README.md'), '# api\n');
+  writeFileSync(join(seedDir, '.gitignore'), '*.env\nignored-dir/\n');
+  git(seedDir, 'add', '-A');
+  git(seedDir, 'commit', '-qm', 'init');
+  git(seedDir, 'branch', 'feat/login');
+  git(seedDir, 'branch', 'base/other');
+
+  writeFileSync(join(seedDir, 'main-only.txt'), 'default branch\n');
+  git(seedDir, 'add', '-A');
+  git(seedDir, 'commit', '-qm', 'main update');
+
+  git(seedDir, 'checkout', '-qb', 'pr/source');
+  writeFileSync(join(seedDir, 'PR.md'), 'review commit 1\n');
+  git(seedDir, 'add', '-A');
+  git(seedDir, 'commit', '-qm', 'pr commit 1');
+  prCommit1 = git(seedDir, 'rev-parse', 'HEAD');
+  writeFileSync(join(seedDir, 'PR.md'), 'review commit 2\n');
+  git(seedDir, 'add', '-A');
+  git(seedDir, 'commit', '-qm', 'pr commit 2');
+  prCommit2 = git(seedDir, 'rev-parse', 'HEAD');
+  git(seedDir, 'checkout', '-q', 'main');
+
+  git(sandbox, 'clone', '-q', '--bare', seedDir, originDir);
+  git(originDir, 'update-ref', '-d', 'refs/heads/pr/source');
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit1);
 
   shimDir = mkdtempSync(join(tmpdir(), 'gwqpull-shims-'));
   const write = (name, body) => {
@@ -82,6 +102,17 @@ esac
 exit 0
 `);
 
+  write('gh', `#!/bin/sh
+case "$1" in
+  --version) echo "gh version 2.50.0"; exit 0 ;;
+  pr)
+    [ "$2" = "view" ] || exit 1
+    printf '%s\\n' '{"headRefName":"pr/source","isCrossRepository":false,"state":"OPEN","title":"Review PR"}'
+    exit 0 ;;
+esac
+exit 1
+`);
+
   // gwq's real naming template is its own business; the shim only has to put
   // the worktree somewhere and report the git command it ran, which is how the
   // CLI recovers a collision path from the error text.
@@ -104,9 +135,9 @@ if [ -e "$wt" ] && [ -n "$(ls -A "$wt" 2>/dev/null)" ]; then
   exit 1
 fi
 if [ "$newbranch" = "1" ]; then
-  # Mirrors git: the branch is created while preparing, so a destination
-  # failure leaves it behind. Reproducing that is the only reason the
-  # rollback test means anything.
+  # Keep the legacy -b path available for the collision parser coverage. The
+  # CLI now pre-creates missing branches explicitly, so its normal path uses
+  # the branch-only form below.
   git branch "$branch" HEAD >/dev/null 2>&1
   git worktree add "$wt" "$branch" >/dev/null 2>&1 || exit 1
 else
@@ -301,12 +332,75 @@ test('the main clone holding the branch is reported as isMainClone', () => {
   assert.equal(j.created, false);
 });
 
-test('a branch that exists nowhere is created with -b', () => {
+test('a branch that exists nowhere is created from the default branch', () => {
   resetClone();
   const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'brand/new']));
   assert.equal(j.created, true);
   assert.equal(j.branch, 'brand/new');
   assert.equal(git(j.path, 'rev-parse', '--abbrev-ref', 'HEAD'), 'brand/new');
+});
+
+test('an existing branch keeps its own history', () => {
+  resetClone();
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  const clone = join(ghqRoot, SLUG);
+  assert.equal(git(j.path, 'rev-parse', 'HEAD'), git(clone, 'rev-parse', 'origin/feat/login'));
+  assert.ok(!existsSync(join(j.path, 'main-only.txt')), 'existing branches must not be rebased onto default');
+});
+
+test('help documents default-branch and ignored-file behavior', () => {
+  const r = run(['--help']);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /origin\/HEAD/);
+  assert.match(r.stdout, /--copy-ignored-files/);
+});
+
+test('a new branch starts from the default branch, not main clone HEAD', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  git(clone, 'checkout', '-q', '-b', 'base/other', 'origin/base/other');
+
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'brand/from-default']));
+  assert.equal(j.created, true);
+  assert.equal(git(j.path, 'rev-parse', 'HEAD'), git(clone, 'rev-parse', 'origin/main'));
+  assert.ok(existsSync(join(j.path, 'main-only.txt')), 'the default branch commit must be present');
+});
+
+test('an existing PR worktree refreshes to the latest PR head', () => {
+  resetClone();
+  const first = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42']));
+  assert.equal(first.branch, 'pr-42');
+  assert.equal(git(first.path, 'rev-parse', 'HEAD'), prCommit1);
+
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit2);
+  const second = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42']));
+  assert.equal(second.path, first.path);
+  assert.equal(second.created, false);
+  assert.equal(git(second.path, 'rev-parse', 'HEAD'), prCommit2);
+});
+
+test('--copy-ignored-files seeds missing ignored files without overwriting', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, '.env'), 'API_URL=https://local.example\n');
+  mkdirSync(join(clone, 'ignored-dir'), { recursive: true });
+  writeFileSync(join(clone, 'ignored-dir', 'nested.txt'), 'nested ignored\n');
+  writeFileSync(join(clone, 'notes.txt'), 'ordinary untracked\n');
+
+  const j = out(run([
+    '--json', '-n', '--no-fetch', '--copy-ignored-files', 'alice/api', 'feat/login',
+  ]));
+  assert.equal(readFileSync(join(j.path, '.env'), 'utf8'), 'API_URL=https://local.example\n');
+  assert.equal(readFileSync(join(j.path, 'ignored-dir', 'nested.txt'), 'utf8'), 'nested ignored\n');
+  assert.ok(!existsSync(join(j.path, 'notes.txt')), 'ordinary untracked files must stay out');
+
+  writeFileSync(join(j.path, '.env'), 'API_URL=https://review.example\n');
+  out(run([
+    '--json', '-n', '--no-fetch', '--copy-ignored-files', 'alice/api', 'feat/login',
+  ]));
+  assert.equal(readFileSync(join(j.path, '.env'), 'utf8'), 'API_URL=https://review.example\n');
 });
 
 test('an origin-only branch is checked out without -b', () => {
@@ -468,8 +562,8 @@ for (const shell of ['zsh', 'bash', 'fish']) {
 test('a blocked worktree rolls the half-created branch back', () => {
   // gwq sanitises `/` to `-`, so asking for `feat-login` lands on the very
   // directory `feat/login` already occupies — an easy collision to hit without
-  // meaning to. `git worktree add -b` creates the branch before failing on the
-  // destination, and leaving it turns the next run into "already exists".
+  // meaning to. A failed worktree creation can leave the just-created branch
+  // behind, and leaving it turns the next run into "already exists".
   resetClone();
   out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
   const collide = join(wtBase, 'feat-blocked');
