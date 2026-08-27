@@ -181,6 +181,9 @@ is a fallback for states git's porcelain does not cover, not the primary path.
 All three fetch `refs/pull/N/head` into the stable internal ref
 `refs/gwqpull/pull/N/head`. The worktree is fast-forwarded from that ref on each
 normal invocation, so an existing review follows new commits pushed to the PR.
+Fallback branches also record an internal association in
+`refs/gwqpull/pull/N/branch`; an unrelated pre-existing `pr-N` branch is rejected
+instead of being advanced silently.
 The fork case must warn that no upstream is set. Collapsing these into "just
 use headRefName" breaks two of the three.
 

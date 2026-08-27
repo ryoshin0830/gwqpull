@@ -89,7 +89,9 @@ review worktree when it is clean and has not diverged. Dirty or diverged review
 work is left intact with a warning. If the user explicitly wants ignored local
 configuration files such as `.env` copied from the GHQ clone, add
 `--copy-ignored-files`; it copies only missing ignored paths and leaves ordinary
-untracked files and existing destination files alone.
+untracked files and existing destination files alone. A pre-existing local
+fallback branch named `pr-N` that was not created by gwqpull is left untouched
+and reported as a conflict.
 
 ## Output (stdout, 1 line)
 

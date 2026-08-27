@@ -12,8 +12,9 @@ Make `gwqpull` reliable for repeated code review: new local branches start at th
 4. Preserve the existing safety rule: dirty or diverged worktrees are not reset or force-updated. Emit a warning and continue with the existing checkout when a fast-forward is impossible.
 5. Add `--copy-ignored-files`. It is opt-in, never prompts, copies files ignored by the original GHQ clone's Git rules into the destination worktree, creates missing parent directories, and does not overwrite or delete destination files.
 6. The copy option must copy ignored files only; ordinary untracked files must remain excluded.
-7. Preserve existing output streams, JSON schema, exit codes, collision handling, submodule initialization, and `--no-fetch` behavior. `--no-fetch` skips remote refresh and the associated fast-forward attempts; the ignored-file copy remains controlled by its own explicit option.
-8. Update help, README, and maintainer guidance with the new branch-base, PR-refresh, and ignored-file semantics.
+7. A fallback `pr-<number>` branch is refreshed only when it is associated with that PR by `gwqpull`; an unrelated pre-existing branch must not be changed.
+8. Preserve existing output streams, JSON schema, exit codes, collision handling, submodule initialization, and `--no-fetch` behavior. `--no-fetch` skips remote refresh and the associated fast-forward attempts; the ignored-file copy remains controlled by its own explicit option.
+9. Update help, README, and maintainer guidance with the new branch-base, PR-refresh, and ignored-file semantics.
 
 ## Design
 
@@ -25,13 +26,13 @@ For a completely new requested branch, create a local branch at `origin/<default
 
 ### Pull-request refresh
 
-For PR URL inputs, fetch `refs/pull/<number>/head` into `refs/gwqpull/pull/<number>/head`. The ref is an internal cache of the latest reviewable commit. Same-repository PRs retain their head branch name when that branch exists; fork PRs and deleted-head cases retain the existing `pr-<number>` local branch convention.
+For PR URL inputs, fetch `refs/pull/<number>/head` into `refs/gwqpull/pull/<number>/head`. The ref is an internal cache of the latest reviewable commit. Same-repository PRs retain their head branch name when that branch exists; fork PRs and deleted-head cases retain the existing `pr-<number>` local branch convention. Fallback branches are associated through `refs/gwqpull/pull/<number>/branch`; a pre-existing unassociated `pr-<number>` is rejected rather than advanced.
 
 After the worktree is found or created, fast-forward it from the PR cache ref. This handles both an existing worktree and a newly created worktree whose local branch was stale. A failed fast-forward is reported as a warning and never rewritten. For non-PR inputs, the existing `origin/<branch>` fast-forward behavior remains.
 
 ### Ignored-file seeding
 
-When `--copy-ignored-files` is present, enumerate the original clone's ignored untracked paths using `git ls-files --others --ignored --exclude-standard -z`. Copy each source path to the same relative path under the destination worktree with native Node filesystem operations. Existing destination paths are skipped, so the operation is safe to repeat and cannot overwrite review-specific environment settings. Source and destination resolving to the same path is a no-op.
+When `--copy-ignored-files` is present, enumerate the original clone's ignored untracked paths using `git ls-files --others --ignored --exclude-standard -z`. Copy each source path to the same relative path under the destination worktree with native Node filesystem operations. Existing destination paths are skipped, so the operation is safe to repeat and cannot overwrite review-specific environment settings. Destination paths are checked for symlinked parents before writing. Source and destination resolving to the same path is a no-op.
 
 Copy failures are surfaced as a worktree error with the affected path. The operation never deletes destination-only files and never copies ordinary untracked files.
 

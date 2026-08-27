@@ -103,6 +103,8 @@ the branch and the worktree already existed.
 - An existing worktree is never handed to `gwq add`. It gets a `--ff-only`
   merge from `origin/<branch>` or the latest PR head, and a divergence or a
   dirty tree is a warning, not a rewrite.
+- A fallback `pr-N` branch is updated only when it was created and associated
+  by `gwqpull`; an unrelated local `pr-N` branch fails with an actionable error.
 - `--copy-ignored-files` never overwrites an existing destination file and
   never deletes anything. It is a one-way, opt-in seed for local configuration.
 - A colliding directory is only touched with `-f`, and then it is **moved** to
@@ -140,7 +142,8 @@ PR URLs cover the three shapes that actually happen:
 
 All three cases refresh an existing review worktree from the PR head on each
 normal run. If the worktree has local changes or diverged commits, the command
-warns and leaves it untouched.
+warns and leaves it untouched. If a local fallback branch with the same `pr-N`
+name was not created by `gwqpull`, the command stops instead of changing it.
 
 ### Local environment files
 
