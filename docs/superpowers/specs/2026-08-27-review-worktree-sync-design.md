@@ -64,4 +64,3 @@ Extend the real-Git shim suite to cover:
 - Calling `git worktree add` directly with an explicit path would give full start-point control but would duplicate gwq's path template and collision behavior.
 - Resetting the review branch to the fetched PR commit would guarantee freshness but could destroy local review notes or edits.
 - Overwriting all ignored destination files would synchronize environment changes but could destroy locally customized secrets. Missing-only copy is safer and matches the opt-in seeding use case.
-
