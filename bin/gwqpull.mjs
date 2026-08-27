@@ -563,6 +563,11 @@ function pullFastForward(wt, branch) {
 
 function pullFastForwardRef(wt, branch, sourceRef) {
   if (!hasRef(wt, sourceRef)) return;
+  const status = git(wt, ['status', '--porcelain', '--untracked-files=all']);
+  if (status.status !== 0 || (status.stdout ?? '').trim()) {
+    warn(`could not fast-forward ${branch} to ${sourceRef} — the tree is dirty. Pull by hand.`);
+    return;
+  }
   const r = git(wt, ['merge', '--ff-only', sourceRef]);
   if (r.status === 0) {
     if (!(r.stdout ?? '').includes('Already up to date')) {
@@ -636,8 +641,34 @@ function isWithin(root, candidate) {
   return candidatePath === rootPath || candidatePath.startsWith(`${rootPath}${sep}`);
 }
 
+// Lexical containment does not protect a write through a symlinked parent.
+// Check every existing component before mkdir/copy; the destination root is
+// realpathed by seedIgnoredFiles so the root itself cannot redirect the write.
+function hasSymlinkInPath(root, candidate) {
+  const rootPath = resolve(root);
+  let current = resolve(candidate);
+  if (!isWithin(rootPath, current)) return true;
+  while (current !== rootPath) {
+    try {
+      if (lstatSync(current).isSymbolicLink()) return true;
+    } catch (err) {
+      if (err.code !== 'ENOENT') return true;
+    }
+    const parent = dirname(current);
+    if (parent === current) return true;
+    current = parent;
+  }
+  return false;
+}
+
 function seedIgnoredFiles(sourceDir, destinationDir) {
   if (samePath(sourceDir, destinationDir)) return;
+  let destinationRoot;
+  try {
+    destinationRoot = realpathSync(destinationDir);
+  } catch (err) {
+    die('E_WORKTREE', `could not resolve worktree path ${destinationDir}: ${err.message}`);
+  }
 
   const r = git(sourceDir, [
     'ls-files', '--others', '--ignored', '--exclude-standard', '-z',
@@ -651,8 +682,8 @@ function seedIgnoredFiles(sourceDir, destinationDir) {
   let skipped = 0;
   for (const entry of entries) {
     const sourcePath = resolve(sourceDir, entry);
-    const destinationPath = resolve(destinationDir, entry);
-    if (!isWithin(sourceDir, sourcePath) || !isWithin(destinationDir, destinationPath)) {
+    const destinationPath = resolve(destinationRoot, entry);
+    if (!isWithin(sourceDir, sourcePath) || !isWithin(destinationRoot, destinationPath)) {
       die('E_WORKTREE', `ignored file path escapes the worktree: ${entry}`);
     }
     if (!pathExists(sourcePath)) continue;
@@ -660,8 +691,14 @@ function seedIgnoredFiles(sourceDir, destinationDir) {
       skipped++;
       continue;
     }
+    if (hasSymlinkInPath(destinationRoot, destinationPath)) {
+      die('E_WORKTREE', `ignored file path crosses a symlink in the worktree: ${entry}`);
+    }
     try {
       mkdirSync(dirname(destinationPath), { recursive: true });
+      if (hasSymlinkInPath(destinationRoot, destinationPath)) {
+        die('E_WORKTREE', `ignored file path crosses a symlink in the worktree: ${entry}`);
+      }
       cpSync(sourcePath, destinationPath, { recursive: true, force: false });
       copied++;
     } catch (err) {
@@ -871,6 +908,9 @@ function ensureClone(dir, url, slug) {
     if (doFetch) {
       const r = git(dir, ['fetch', '--prune', '--quiet', 'origin'], { stdio: childStdio });
       if (r.status !== 0) warn('fetch failed — carrying on with the local refs');
+      else if (git(dir, ['remote', 'set-head', 'origin', '--auto'], { stdio: 'ignore' }).status !== 0) {
+        warn('could not refresh origin/HEAD — using the existing default branch');
+      }
     }
     return dir;
   }
@@ -893,6 +933,19 @@ function ensureClone(dir, url, slug) {
 // been deleted. The last two both resolve through refs/pull/N/head into a
 // local pr-N branch.
 const prHeadRef = (prNumber) => `refs/gwqpull/pull/${prNumber}/head`;
+const prBranchRef = (prNumber) => `refs/gwqpull/pull/${prNumber}/branch`;
+
+function isManagedPrBranch(dir, branch, associationRef) {
+  const associatedTip = gitOut(dir, ['rev-parse', associationRef]);
+  if (!associatedTip) return false;
+  return git(dir, [
+    'merge-base', '--is-ancestor', associatedTip, `refs/heads/${branch}`,
+  ], { stdio: 'ignore' }).status === 0;
+}
+
+function rememberPrBranch(dir, associationRef, sourceRef) {
+  return git(dir, ['update-ref', associationRef, sourceRef], { stdio: 'ignore' }).status === 0;
+}
 
 async function resolvePrBranch(dir, url, prNumber, host) {
   await ensureTool('gh');
@@ -918,6 +971,7 @@ async function resolvePrBranch(dir, url, prNumber, host) {
   log(`${dim('│')} PR #${prNumber} ${dim(`[${pr.state}]`)} ${pr.title}`);
 
   const sourceRef = prHeadRef(prNumber);
+  const associationRef = prBranchRef(prNumber);
   let cachedRef = hasRef(dir, sourceRef) ? sourceRef : '';
 
   // Keep a stable local ref for the latest reviewable commit. A force update is
@@ -932,18 +986,26 @@ async function resolvePrBranch(dir, url, prNumber, host) {
   }
 
   const materialisePrBranch = (branch, failure) => {
-    if (hasLocalBranch(dir, branch)) return;
+    if (hasLocalBranch(dir, branch)) return isManagedPrBranch(dir, branch, associationRef);
     const made = cachedRef
       ? git(dir, ['branch', '--quiet', branch, cachedRef], { stdio: 'ignore' })
       : { status: 1 };
     if (made.status !== 0) die('E_PR', failure);
+    if (!rememberPrBranch(dir, associationRef, cachedRef)) {
+      die('E_PR', `could not record local branch ${branch} for PR #${prNumber}`);
+    }
+    return true;
   };
 
   if (pr.isCrossRepository === true) {
     const branch = `pr-${prNumber}`;
-    materialisePrBranch(branch, `could not fetch refs/pull/${prNumber}/head (remove --no-fetch to refresh it)`);
+    const managed = materialisePrBranch(branch,
+      `could not fetch refs/pull/${prNumber}/head (remove --no-fetch to refresh it)`);
+    if (!managed) {
+      die('E_PR', `local branch ${branch} already exists and is not associated with PR #${prNumber}`);
+    }
     warn(`fork PR — no upstream is set. Pushing needs the fork added as a remote.`);
-    return { branch, sourceRef: cachedRef };
+    return { branch, sourceRef: cachedRef, associationRef };
   }
 
   if (hasLocalBranch(dir, pr.headRefName) || hasRemoteBranch(dir, pr.headRefName)) {
@@ -951,10 +1013,13 @@ async function resolvePrBranch(dir, url, prNumber, host) {
   }
 
   const branch = `pr-${prNumber}`;
-  materialisePrBranch(branch,
+  const managed = materialisePrBranch(branch,
     `neither ${pr.headRefName} nor refs/pull/${prNumber}/head could be found (remove --no-fetch to refresh it)`);
+  if (!managed) {
+    die('E_PR', `local branch ${branch} already exists and is not associated with PR #${prNumber}`);
+  }
   warn(`${pr.headRefName} is gone from the remote — fetched it as ${branch} instead`);
-  return { branch, sourceRef: cachedRef };
+  return { branch, sourceRef: cachedRef, associationRef };
 }
 
 // A collision's destination has to be recovered from gwq's error text. Two
@@ -1140,10 +1205,12 @@ async function main() {
 
   let branch = positionals[1] ?? spec.hint;
   let sourceRef = '';
+  let associationRef = '';
   if (spec.pr) {
     const resolved = await resolvePrBranch(dir, url, spec.pr, spec.host);
     branch = resolved.branch;
     sourceRef = resolved.sourceRef;
+    associationRef = resolved.associationRef ?? '';
   }
   if (!branch) {
     await ensureTool('fzf');
@@ -1151,6 +1218,14 @@ async function main() {
   }
 
   const wt = ensureWorktree(dir, branch, sourceRef);
+
+  if (associationRef && sourceRef && git(dir, [
+    'merge-base', '--is-ancestor', sourceRef, `refs/heads/${branch}`,
+  ], { stdio: 'ignore' }).status === 0) {
+    if (!rememberPrBranch(dir, associationRef, sourceRef)) {
+      die('E_PR', `could not record the refreshed branch ${branch} for PR #${spec.pr}`);
+    }
+  }
 
   if (copyIgnored) seedIgnoredFiles(dir, wt.path);
 

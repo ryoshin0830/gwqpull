@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync, mkdirSync, existsSync, readdirSync, realpathSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync, mkdirSync, existsSync, readdirSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -380,6 +380,32 @@ test('an existing PR worktree refreshes to the latest PR head', () => {
   assert.equal(git(second.path, 'rev-parse', 'HEAD'), prCommit2);
 });
 
+test('a dirty PR worktree is not fast-forwarded', () => {
+  resetClone();
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit1);
+  const first = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42']));
+  writeFileSync(join(first.path, 'review-notes.txt'), 'keep this note\n');
+
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit2);
+  const second = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42']));
+  assert.equal(git(second.path, 'rev-parse', 'HEAD'), prCommit1);
+  assert.equal(readFileSync(join(second.path, 'review-notes.txt'), 'utf8'), 'keep this note\n');
+});
+
+test('an unrelated existing pr-N branch is not changed by a PR URL', () => {
+  resetClone();
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit1);
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  git(clone, 'branch', 'pr-42', 'origin/main');
+
+  const r = run(['--json', '-n', 'https://github.com/alice/api/pull/42']);
+  assert.equal(r.status, 1);
+  assert.equal(jsonLine(r.stderr).error.code, 'E_PR');
+  assert.equal(git(clone, 'rev-parse', 'refs/heads/pr-42'), git(clone, 'rev-parse', 'origin/main'));
+  assert.ok(!existsSync(join(wtBase, 'pr-42')), 'an unrelated PR branch must not get a review worktree');
+});
+
 test('--copy-ignored-files seeds missing ignored files without overwriting', () => {
   resetClone();
   out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
@@ -401,6 +427,26 @@ test('--copy-ignored-files seeds missing ignored files without overwriting', () 
     '--json', '-n', '--no-fetch', '--copy-ignored-files', 'alice/api', 'feat/login',
   ]));
   assert.equal(readFileSync(join(j.path, '.env'), 'utf8'), 'API_URL=https://review.example\n');
+});
+
+test('--copy-ignored-files refuses symlinked destination parents', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  mkdirSync(join(clone, 'ignored-dir'), { recursive: true });
+  writeFileSync(join(clone, 'ignored-dir', 'nested.txt'), 'must stay inside\n');
+
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  const outside = join(sandbox, 'outside');
+  mkdirSync(outside);
+  symlinkSync(outside, join(j.path, 'ignored-dir'));
+
+  const r = run([
+    '--json', '-n', '--no-fetch', '--copy-ignored-files', 'alice/api', 'feat/login',
+  ]);
+  assert.equal(r.status, 1);
+  assert.equal(jsonLine(r.stderr).error.code, 'E_WORKTREE');
+  assert.ok(!existsSync(join(outside, 'nested.txt')), 'copy must not follow a destination symlink');
 });
 
 test('an origin-only branch is checked out without -b', () => {
@@ -621,4 +667,18 @@ test('re-sourcing is idempotent even with a stale function defined', (t) => {
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /^gwqpull \d+\.\d+\.\d+/m, 'the new function must have replaced the stale one');
   assert.doesNotMatch(r.stderr, /cd:|no such file/);
+});
+
+test('new branches follow a renamed remote default branch', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  git(clone, 'config', 'remote.origin.followRemoteHead', 'never');
+  const mainTip = git(originDir, 'rev-parse', 'refs/heads/main');
+  git(originDir, 'update-ref', 'refs/heads/trunk', mainTip);
+  git(originDir, 'update-ref', '-d', 'refs/heads/main');
+  git(originDir, 'symbolic-ref', 'HEAD', 'refs/heads/trunk');
+
+  const j = out(run(['--json', '-n', 'alice/api', 'brand/after-rename']));
+  assert.equal(git(j.path, 'rev-parse', 'HEAD'), git(clone, 'rev-parse', 'origin/trunk'));
 });
