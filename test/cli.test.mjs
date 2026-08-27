@@ -367,6 +367,21 @@ test('a new branch starts from the default branch, not main clone HEAD', () => {
   assert.ok(existsSync(join(j.path, 'main-only.txt')), 'the default branch commit must be present');
 });
 
+test('a newly-created branch does not track the default branch', () => {
+  resetClone();
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'brand/no-upstream']));
+  assert.equal(
+    gitTry(j.path, 'config', '--get', 'branch.brand/no-upstream.remote').status,
+    1,
+    'a branch created from origin/HEAD must not track the default branch',
+  );
+  assert.equal(
+    gitTry(j.path, 'config', '--get', 'branch.brand/no-upstream.merge').status,
+    1,
+    'a branch created from origin/HEAD must not have an upstream merge ref',
+  );
+});
+
 test('an existing PR worktree refreshes to the latest PR head', () => {
   resetClone();
   const first = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42']));

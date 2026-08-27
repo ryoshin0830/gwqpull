@@ -1107,7 +1107,7 @@ function ensureWorktree(dir, branch, sourceRef = '') {
   if (!known) {
     const base = defaultBranch(dir);
     const made = git(dir, [
-      'branch', '--quiet', branch, `refs/remotes/origin/${base}`,
+      'branch', '--quiet', '--no-track', branch, `refs/remotes/origin/${base}`,
     ], { stdio: 'ignore' });
     if (made.status !== 0) {
       die('E_BRANCH', `could not create ${branch} from the default branch origin/${base}`);
