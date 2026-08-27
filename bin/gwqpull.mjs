@@ -2,7 +2,11 @@
 import { spawnSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { Buffer } from 'node:buffer';
-import { readFileSync, existsSync, readdirSync, renameSync, realpathSync } from 'node:fs';
+import {
+  readFileSync, existsSync, readdirSync, renameSync, realpathSync,
+  cpSync, lstatSync, mkdirSync,
+} from 'node:fs';
+import { dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Read from package.json rather than a hand-maintained constant: `npm version`
@@ -26,6 +30,7 @@ OPTIONS
   --cmd <name>       function name emitted by --init (default: ${PKG})
   --no-fetch         skip \`git fetch\` and the ff-only catch-up
   --no-submodules    skip \`git submodule update --init --recursive\`
+  --copy-ignored-files  copy missing Git-ignored files from the GHQ clone
   -f, --force        move a colliding worktree directory aside instead of failing
   -n, --no-cd        do the work and report the path, but do not move the shell
   --json             stdout = 1-line JSON
@@ -55,10 +60,12 @@ EXAMPLES
 WHAT IT DOES
   1. clone (\`ghq get\`) if the repository is not on disk, else \`git fetch --prune\`
   2. resolve the branch — from the argument, the URL, the PR head, or fzf
-  3. reuse the existing worktree if there is one (fast-forwarding it), else
-     \`gwq add\` a new one, creating the branch when it does not exist yet
-  4. \`git submodule update --init --recursive\` when the tree has submodules
-  5. hand the path back so the shell can cd there
+  3. create a new branch from the repository default (\`origin/HEAD\`) when needed
+     and refresh PR worktrees from the latest PR head
+  4. reuse the existing worktree if there is one (fast-forwarding it), else \`gwq add\`
+  5. copy missing ignored files only when \`--copy-ignored-files\` is requested
+  6. \`git submodule update --init --recursive\` when the tree has submodules
+  7. hand the path back so the shell can cd there
 
   Re-running is safe: every step lands in the same place whether or not the
   clone, the branch and the worktree already existed.
@@ -109,6 +116,7 @@ try {
       cmd: { type: 'string' },
       'no-fetch': { type: 'boolean' },
       'no-submodules': { type: 'boolean' },
+      'copy-ignored-files': { type: 'boolean' },
       force: { type: 'boolean', short: 'f' },
       'no-cd': { type: 'boolean', short: 'n' },
       json: { type: 'boolean' },
@@ -380,6 +388,7 @@ if (positionals.length > 2) {
 
 const doFetch = !values['no-fetch'];
 const doSubmodules = !values['no-submodules'];
+const copyIgnored = !!values['copy-ignored-files'];
 const force = !!values.force;
 const stayOut = !!values['no-cd'];
 
@@ -515,6 +524,9 @@ const hasLocalBranch = (dir, br) =>
 const hasRemoteBranch = (dir, br) =>
   git(dir, ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${br}`], { stdio: 'ignore' }).status === 0;
 
+const hasRef = (dir, ref) =>
+  git(dir, ['show-ref', '--verify', '--quiet', ref], { stdio: 'ignore' }).status === 0;
+
 // git reports resolved paths in `worktree list`, so a plain string compare
 // against a path we assembled ourselves can miss (/var vs /private/var on
 // macOS, or any symlinked ghq root).
@@ -546,14 +558,24 @@ function worktreePath(dir, branch) {
 // carry on, never rewrite work the user has in progress.
 function pullFastForward(wt, branch) {
   if (!hasRemoteBranch(wt, branch)) return; // pr-N and friends have no origin ref
-  const r = git(wt, ['merge', '--ff-only', `origin/${branch}`]);
+  pullFastForwardRef(wt, branch, `origin/${branch}`);
+}
+
+function pullFastForwardRef(wt, branch, sourceRef) {
+  if (!hasRef(wt, sourceRef)) return;
+  const status = git(wt, ['status', '--porcelain', '--untracked-files=all']);
+  if (status.status !== 0 || (status.stdout ?? '').trim()) {
+    warn(`could not fast-forward ${branch} to ${sourceRef} — the tree is dirty. Pull by hand.`);
+    return;
+  }
+  const r = git(wt, ['merge', '--ff-only', sourceRef]);
   if (r.status === 0) {
     if (!(r.stdout ?? '').includes('Already up to date')) {
-      log(`${dim('│')} ${green('✓')} fast-forwarded to origin/${branch}`);
+      log(`${dim('│')} ${green('✓')} fast-forwarded ${branch} to ${sourceRef}`);
     }
     return;
   }
-  warn(`could not fast-forward to origin/${branch} — diverged, or the tree is dirty. Pull by hand.`);
+  warn(`could not fast-forward ${branch} to ${sourceRef} — diverged, or the tree is dirty. Pull by hand.`);
 }
 
 // The path ghq already has for this slug, or '' if it has none.
@@ -569,6 +591,125 @@ function primaryRoot() {
   const root = r.status === 0 ? (r.stdout ?? '').trim().split('\n')[0] : '';
   if (!root) die('E_CLONE', '`ghq root` returned nothing — is ghq configured?');
   return root;
+}
+
+function defaultBranch(dir) {
+  let branch = gitOut(dir, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+  if (branch.startsWith('origin/')) branch = branch.slice('origin/'.length);
+
+  if (!branch) {
+    const r = git(dir, ['ls-remote', '--symref', 'origin', 'HEAD']);
+    const line = (r.stdout ?? '').split('\n').find((entry) => entry.startsWith('ref: refs/heads/'));
+    branch = line?.match(/^ref: refs\/heads\/(.+)\s+HEAD$/)?.[1] ?? '';
+    if (branch) {
+      git(dir, [
+        'symbolic-ref', 'refs/remotes/origin/HEAD', `refs/remotes/origin/${branch}`,
+      ], { stdio: 'ignore' });
+    }
+  }
+
+  if (!branch) {
+    die('E_BRANCH', 'could not determine the repository default branch from origin/HEAD');
+  }
+
+  if (!hasRemoteBranch(dir, branch)) {
+    if (!doFetch) {
+      die('E_BRANCH', `the default branch origin/${branch} is not available; re-run without --no-fetch`);
+    }
+    const r = git(dir, [
+      'fetch', '--quiet', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`,
+    ], { stdio: childStdio });
+    if (r.status !== 0 || !hasRemoteBranch(dir, branch)) {
+      die('E_BRANCH', `could not fetch the repository default branch origin/${branch}`);
+    }
+  }
+  return branch;
+}
+
+function pathExists(path) {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isWithin(root, candidate) {
+  const rootPath = resolve(root);
+  const candidatePath = resolve(candidate);
+  return candidatePath === rootPath || candidatePath.startsWith(`${rootPath}${sep}`);
+}
+
+// Lexical containment does not protect a write through a symlinked parent.
+// Check every existing component before mkdir/copy; the destination root is
+// realpathed by seedIgnoredFiles so the root itself cannot redirect the write.
+function hasSymlinkInPath(root, candidate) {
+  const rootPath = resolve(root);
+  let current = resolve(candidate);
+  if (!isWithin(rootPath, current)) return true;
+  while (current !== rootPath) {
+    try {
+      if (lstatSync(current).isSymbolicLink()) return true;
+    } catch (err) {
+      if (err.code !== 'ENOENT') return true;
+    }
+    const parent = dirname(current);
+    if (parent === current) return true;
+    current = parent;
+  }
+  return false;
+}
+
+function seedIgnoredFiles(sourceDir, destinationDir) {
+  if (samePath(sourceDir, destinationDir)) return;
+  let destinationRoot;
+  try {
+    destinationRoot = realpathSync(destinationDir);
+  } catch (err) {
+    die('E_WORKTREE', `could not resolve worktree path ${destinationDir}: ${err.message}`);
+  }
+
+  const r = git(sourceDir, [
+    'ls-files', '--others', '--ignored', '--exclude-standard', '-z',
+  ]);
+  if (r.status !== 0) {
+    die('E_WORKTREE', `could not list ignored files in ${sourceDir}`);
+  }
+
+  const entries = (r.stdout ?? '').split('\0').filter(Boolean);
+  let copied = 0;
+  let skipped = 0;
+  for (const entry of entries) {
+    const sourcePath = resolve(sourceDir, entry);
+    const destinationPath = resolve(destinationRoot, entry);
+    if (!isWithin(sourceDir, sourcePath) || !isWithin(destinationRoot, destinationPath)) {
+      die('E_WORKTREE', `ignored file path escapes the worktree: ${entry}`);
+    }
+    if (!pathExists(sourcePath)) continue;
+    if (pathExists(destinationPath)) {
+      skipped++;
+      continue;
+    }
+    if (hasSymlinkInPath(destinationRoot, destinationPath)) {
+      die('E_WORKTREE', `ignored file path crosses a symlink in the worktree: ${entry}`);
+    }
+    try {
+      mkdirSync(dirname(destinationPath), { recursive: true });
+      if (hasSymlinkInPath(destinationRoot, destinationPath)) {
+        die('E_WORKTREE', `ignored file path crosses a symlink in the worktree: ${entry}`);
+      }
+      cpSync(sourcePath, destinationPath, { recursive: true, force: false });
+      copied++;
+    } catch (err) {
+      die('E_WORKTREE', `could not copy ignored file ${entry}: ${err.message}`);
+    }
+  }
+
+  if (copied || skipped) {
+    log(`${dim('│')} copied ${copied} ignored file(s)` +
+      (skipped ? `, kept ${skipped} existing file(s)` : ''));
+  }
 }
 
 // ── repository spec parsing ──────────────────────────────────────────────────
@@ -767,6 +908,9 @@ function ensureClone(dir, url, slug) {
     if (doFetch) {
       const r = git(dir, ['fetch', '--prune', '--quiet', 'origin'], { stdio: childStdio });
       if (r.status !== 0) warn('fetch failed — carrying on with the local refs');
+      else if (git(dir, ['remote', 'set-head', 'origin', '--auto'], { stdio: 'ignore' }).status !== 0) {
+        warn('could not refresh origin/HEAD — using the existing default branch');
+      }
     }
     return dir;
   }
@@ -788,6 +932,21 @@ function ensureClone(dir, url, slug) {
 // head is not on origin at all), and a merged PR whose head branch has since
 // been deleted. The last two both resolve through refs/pull/N/head into a
 // local pr-N branch.
+const prHeadRef = (prNumber) => `refs/gwqpull/pull/${prNumber}/head`;
+const prBranchRef = (prNumber) => `refs/gwqpull/pull/${prNumber}/branch`;
+
+function isManagedPrBranch(dir, branch, associationRef) {
+  const associatedTip = gitOut(dir, ['rev-parse', associationRef]);
+  if (!associatedTip) return false;
+  return git(dir, [
+    'merge-base', '--is-ancestor', associatedTip, `refs/heads/${branch}`,
+  ], { stdio: 'ignore' }).status === 0;
+}
+
+function rememberPrBranch(dir, associationRef, sourceRef) {
+  return git(dir, ['update-ref', associationRef, sourceRef], { stdio: 'ignore' }).status === 0;
+}
+
 async function resolvePrBranch(dir, url, prNumber, host) {
   await ensureTool('gh');
   const r = spawnSync('gh', [
@@ -811,37 +970,56 @@ async function resolvePrBranch(dir, url, prNumber, host) {
 
   log(`${dim('│')} PR #${prNumber} ${dim(`[${pr.state}]`)} ${pr.title}`);
 
-  // Grab the PR head early so fork and deleted-branch cases have something to
-  // build on. Best-effort: same-repo PRs do not need it.
+  const sourceRef = prHeadRef(prNumber);
+  const associationRef = prBranchRef(prNumber);
+  let cachedRef = hasRef(dir, sourceRef) ? sourceRef : '';
+
+  // Keep a stable local ref for the latest reviewable commit. A force update is
+  // safe here because this is an internal cache, never a user's branch.
   if (doFetch) {
-    git(dir, ['fetch', '--quiet', 'origin', `refs/pull/${prNumber}/head`], { stdio: 'ignore' });
+    const fetched = git(dir, [
+      'fetch', '--quiet', 'origin',
+      `+refs/pull/${prNumber}/head:${sourceRef}`,
+    ], { stdio: 'ignore' });
+    if (fetched.status === 0) cachedRef = sourceRef;
+    else warn(`could not refresh PR #${prNumber}; using its existing local refs`);
   }
 
   const materialisePrBranch = (branch, failure) => {
-    if (hasLocalBranch(dir, branch)) return;
-    const fetched = git(dir, ['fetch', 'origin', `refs/pull/${prNumber}/head`], { stdio: 'ignore' });
-    const made = fetched.status === 0
-      ? git(dir, ['branch', '--quiet', branch, 'FETCH_HEAD'], { stdio: 'ignore' })
+    if (hasLocalBranch(dir, branch)) return isManagedPrBranch(dir, branch, associationRef);
+    const made = cachedRef
+      ? git(dir, ['branch', '--quiet', branch, cachedRef], { stdio: 'ignore' })
       : { status: 1 };
     if (made.status !== 0) die('E_PR', failure);
+    if (!rememberPrBranch(dir, associationRef, cachedRef)) {
+      die('E_PR', `could not record local branch ${branch} for PR #${prNumber}`);
+    }
+    return true;
   };
 
   if (pr.isCrossRepository === true) {
     const branch = `pr-${prNumber}`;
-    materialisePrBranch(branch, `could not fetch refs/pull/${prNumber}/head`);
+    const managed = materialisePrBranch(branch,
+      `could not fetch refs/pull/${prNumber}/head (remove --no-fetch to refresh it)`);
+    if (!managed) {
+      die('E_PR', `local branch ${branch} already exists and is not associated with PR #${prNumber}`);
+    }
     warn(`fork PR — no upstream is set. Pushing needs the fork added as a remote.`);
-    return branch;
+    return { branch, sourceRef: cachedRef, associationRef };
   }
 
   if (hasLocalBranch(dir, pr.headRefName) || hasRemoteBranch(dir, pr.headRefName)) {
-    return pr.headRefName;
+    return { branch: pr.headRefName, sourceRef: cachedRef };
   }
 
   const branch = `pr-${prNumber}`;
-  materialisePrBranch(branch,
-    `neither ${pr.headRefName} nor refs/pull/${prNumber}/head could be found`);
+  const managed = materialisePrBranch(branch,
+    `neither ${pr.headRefName} nor refs/pull/${prNumber}/head could be found (remove --no-fetch to refresh it)`);
+  if (!managed) {
+    die('E_PR', `local branch ${branch} already exists and is not associated with PR #${prNumber}`);
+  }
   warn(`${pr.headRefName} is gone from the remote — fetched it as ${branch} instead`);
-  return branch;
+  return { branch, sourceRef: cachedRef, associationRef };
 }
 
 // A collision's destination has to be recovered from gwq's error text. Two
@@ -892,8 +1070,14 @@ const runGwqAdd = (dir, addArgs) => {
 //
 // An existing worktree is never handed to `gwq add` — that is where in-progress
 // work lives. It gets fast-forwarded and returned as-is.
-function ensureWorktree(dir, branch) {
+function ensureWorktree(dir, branch, sourceRef = '') {
   git(dir, ['worktree', 'prune'], { stdio: 'ignore' }); // clear hand-deleted leftovers
+
+  const refresh = (path) => {
+    if (!doFetch) return;
+    if (sourceRef) pullFastForwardRef(path, branch, sourceRef);
+    else pullFastForward(path, branch);
+  };
 
   const existing = worktreePath(dir, branch);
   if (existing && existsSync(existing)) {
@@ -905,7 +1089,7 @@ function ensureWorktree(dir, branch) {
     log(isMain
       ? `${dim('│')} the main clone already has ${cyan(branch)} checked out`
       : `${dim('│')} worktree exists  ${dim(existing)}`);
-    if (doFetch) pullFastForward(existing, branch);
+    refresh(existing);
     return { path: existing, created: false, isMainClone: isMain };
   }
 
@@ -913,24 +1097,36 @@ function ensureWorktree(dir, branch) {
   // above — a detached-HEAD-adjacent state, or an older git's porcelain output.
   if (gitOut(dir, ['rev-parse', '--abbrev-ref', 'HEAD']) === branch) {
     log(`${dim('│')} the main clone already has ${cyan(branch)} checked out`);
-    if (doFetch) pullFastForward(dir, branch);
+    refresh(dir);
     return { path: dir, created: false, isMainClone: true };
   }
 
   const known = hasLocalBranch(dir, branch) || hasRemoteBranch(dir, branch);
-  let addArgs = known ? [branch] : ['-b', branch];
-  if (!known) log(`${dim('│')} creating a new branch  ${cyan(branch)}`);
+  let createdByUs = false;
+  const addArgs = [branch];
+  if (!known) {
+    const base = defaultBranch(dir);
+    const made = git(dir, [
+      'branch', '--quiet', '--no-track', branch, `refs/remotes/origin/${base}`,
+    ], { stdio: 'ignore' });
+    if (made.status !== 0) {
+      die('E_BRANCH', `could not create ${branch} from the default branch origin/${base}`);
+    }
+    createdByUs = true;
+    log(`${dim('│')} creating a new branch  ${cyan(branch)} from ${cyan(`origin/${base}`)}`);
+  }
 
   let { out, status } = runGwqAdd(dir, addArgs);
 
-  // `git worktree add -b` creates the branch *before* it fails on the
-  // destination, so a failed run leaves a branch with no worktree. Left alone
-  // it turns the next attempt into "branch already exists" — and the collision
-  // is easy to hit without noticing, because gwq sanitises `/` to `-`: asking
-  // for `feat-template-rate-limit` lands on the directory `feat/template-rate-limit`
-  // already occupies. Only ever undo a branch this run created.
+  // The branch is created explicitly above before gwq is invoked. If gwq fails
+  // on the destination, a failed run can leave that branch with no worktree;
+  // left alone it turns the next attempt into "branch already exists". The
+  // collision is easy to hit without noticing because gwq sanitises `/` to `-`:
+  // asking for `feat-template-rate-limit` lands on the directory
+  // `feat/template-rate-limit` already occupies. Only ever undo a branch this
+  // run created.
   const rollbackBranch = () => {
-    if (known) return; // the user's branch, not ours to delete
+    if (!createdByUs) return; // the user's branch, not ours to delete
     if (!hasLocalBranch(dir, branch)) return;
     if (worktreePath(dir, branch)) return; // it did get a worktree after all
     if (git(dir, ['branch', '-D', branch], { stdio: 'ignore' }).status === 0) {
@@ -939,7 +1135,7 @@ function ensureWorktree(dir, branch) {
   };
 
   if (status !== 0) {
-    const collide = collisionPath(out, addArgs[0] === '-b');
+    const collide = collisionPath(out, false);
     // gwq v0.1.1 does not forward -f to `git worktree add`, so a collision has
     // to be cleared here or not at all.
     if (collide && existsSync(collide) && force) {
@@ -951,9 +1147,6 @@ function ensureWorktree(dir, branch) {
         rollbackBranch();
         die('E_WORKTREE', `could not move ${collide} aside: ${err.message}`);
       }
-      // The first attempt may already have left the branch behind; asking git
-      // to create it a second time would just fail.
-      if (!known && hasLocalBranch(dir, branch)) addArgs = [branch];
       ({ out, status } = runGwqAdd(dir, addArgs));
     }
 
@@ -982,6 +1175,7 @@ function ensureWorktree(dir, branch) {
     rollbackBranch();
     die('E_WORKTREE', `gwq add reported success but the worktree path could not be found for ${branch}`);
   }
+  refresh(created);
   return { path: created, created: true, isMainClone: false };
 }
 
@@ -1010,13 +1204,30 @@ async function main() {
   dir = ensureClone(dir, url, slug);
 
   let branch = positionals[1] ?? spec.hint;
-  if (spec.pr) branch = await resolvePrBranch(dir, url, spec.pr, spec.host);
+  let sourceRef = '';
+  let associationRef = '';
+  if (spec.pr) {
+    const resolved = await resolvePrBranch(dir, url, spec.pr, spec.host);
+    branch = resolved.branch;
+    sourceRef = resolved.sourceRef;
+    associationRef = resolved.associationRef ?? '';
+  }
   if (!branch) {
     await ensureTool('fzf');
     branch = pickBranch(dir);
   }
 
-  const wt = ensureWorktree(dir, branch);
+  const wt = ensureWorktree(dir, branch, sourceRef);
+
+  if (associationRef && sourceRef && git(dir, [
+    'merge-base', '--is-ancestor', sourceRef, `refs/heads/${branch}`,
+  ], { stdio: 'ignore' }).status === 0) {
+    if (!rememberPrBranch(dir, associationRef, sourceRef)) {
+      die('E_PR', `could not record the refreshed branch ${branch} for PR #${spec.pr}`);
+    }
+  }
+
+  if (copyIgnored) seedIgnoredFiles(dir, wt.path);
 
   if (doSubmodules && existsSync(`${wt.path}/.gitmodules`)) {
     log(`${dim('│')} initialising submodules`);

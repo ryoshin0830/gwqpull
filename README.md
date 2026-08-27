@@ -80,10 +80,16 @@ Omit the branch and fzf offers every local and origin branch.
 1. **Clone or fetch.** `ghq get` if the repository is not on disk; otherwise
    `git fetch --prune`.
 2. **Resolve the branch** — from the argument, the URL, the PR head, or fzf.
-3. **Land on a worktree.** Reuse an existing one (fast-forwarding it), else
-   `gwq add`, creating the branch when it does not exist yet.
-4. **Initialise submodules** when the tree has any — `git worktree add` does not.
-5. **Hand the path back** so the shell can `cd` there.
+3. **Choose a base.** A brand-new branch starts from the repository default
+   branch (`origin/HEAD`), regardless of which branch the GHQ clone currently
+   has checked out. A PR uses its latest head commit instead.
+4. **Land on a worktree.** Reuse an existing one and fast-forward it when
+   possible, else `gwq add` it and fast-forward it to the selected source.
+5. **Seed local configuration (optional).** With `--copy-ignored-files`, copy
+   missing Git-ignored files from the GHQ clone; ordinary untracked files are
+   excluded.
+6. **Initialise submodules** when the tree has any — `git worktree add` does not.
+7. **Hand the path back** so the shell can `cd` there.
 
 Re-running is safe. Every step lands in the same place whether or not the clone,
 the branch and the worktree already existed.
@@ -92,8 +98,15 @@ the branch and the worktree already existed.
 
 - An existing clone gets `git fetch --prune`, never `ghq get -u` — that runs
   `git pull --ff-only` internally and fails on a dirty or diverged main clone.
+- A new branch is created at `origin/HEAD`, not at the GHQ clone's current
+  checkout. An existing branch keeps its own history.
 - An existing worktree is never handed to `gwq add`. It gets a `--ff-only`
-  merge, and a divergence or a dirty tree is a warning, not a rewrite.
+  merge from `origin/<branch>` or the latest PR head, and a divergence or a
+  dirty tree is a warning, not a rewrite.
+- A fallback `pr-N` branch is updated only when it was created and associated
+  by `gwqpull`; an unrelated local `pr-N` branch fails with an actionable error.
+- `--copy-ignored-files` never overwrites an existing destination file and
+  never deletes anything. It is a one-way, opt-in seed for local configuration.
 - A colliding directory is only touched with `-f`, and then it is **moved** to
   `<path>.bak-<timestamp>`, never deleted.
 
@@ -109,6 +122,7 @@ gwqpull [options] <repo|URL|PR-URL> [branch]
 | `--cmd <name>` | function name emitted by `--init` (default: `gwqpull`) |
 | `--no-fetch` | skip `git fetch` and the ff-only catch-up |
 | `--no-submodules` | skip `git submodule update --init --recursive` |
+| `--copy-ignored-files` | copy missing Git-ignored files from the GHQ clone |
 | `-f`, `--force` | move a colliding worktree directory aside instead of failing |
 | `-n`, `--no-cd` | do the work and report the path, but do not move the shell |
 | `--json` | stdout = 1-line JSON |
@@ -121,10 +135,29 @@ gwqpull [options] <repo|URL|PR-URL> [branch]
 
 PR URLs cover the three shapes that actually happen:
 
-- **same-repo PR** → its head ref is checked out
+- **same-repo PR** → its head ref is checked out and refreshed from the latest PR head
 - **fork PR** → the head is not on origin, so `refs/pull/N/head` becomes a local
   `pr-N` branch (with a warning that pushing needs the fork as a remote)
 - **merged PR whose branch was deleted** → same `pr-N` fallback
+
+All three cases refresh an existing review worktree from the PR head on each
+normal run. If the worktree has local changes or diverged commits, the command
+warns and leaves it untouched. If a local fallback branch with the same `pr-N`
+name was not created by `gwqpull`, the command stops instead of changing it.
+
+### Local environment files
+
+Some projects keep required development settings in files ignored by Git, such
+as `.env` or files under `config/local/`. To seed those files into a review
+worktree, opt in explicitly:
+
+```console
+$ gwqpull --copy-ignored-files https://github.com/cli/cli/pull/9421
+```
+
+The files are copied from the existing GHQ clone to the same relative paths in
+the worktree. Existing files in the worktree are kept, so a review-specific
+environment file is not overwritten. Ordinary untracked files are not copied.
 
 ## For scripts and AI agents
 

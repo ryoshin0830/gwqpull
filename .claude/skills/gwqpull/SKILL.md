@@ -75,11 +75,23 @@ but a wasted round trip. Decide the branch first:
 
 ## Creating branches
 
-A branch that exists neither locally nor on origin is **created**. That is
-usually what the user wants ("start a new branch"), but it means a typo silently
-becomes a new branch rather than an error. When the user meant an existing
-branch, verify the spelling before calling — or check `created` in the result
-and confirm with them.
+A branch that exists neither locally nor on origin is **created from the
+repository default branch (`origin/HEAD`)**. The GHQ clone's current checkout
+does not affect its base. That is usually what the user wants ("start a new
+branch"), but it means a typo silently becomes a new branch rather than an
+error. When the user meant an existing branch, verify the spelling before
+calling — or check `created` in the result and confirm with them.
+
+## Pull-request refresh and local configuration
+
+For a PR URL, normal runs fetch the latest PR head and fast-forward the existing
+review worktree when it is clean and has not diverged. Dirty or diverged review
+work is left intact with a warning. If the user explicitly wants ignored local
+configuration files such as `.env` copied from the GHQ clone, add
+`--copy-ignored-files`; it copies only missing ignored paths and leaves ordinary
+untracked files and existing destination files alone. A pre-existing local
+fallback branch named `pr-N` that was not created by gwqpull is left untouched
+and reported as a conflict.
 
 ## Output (stdout, 1 line)
 

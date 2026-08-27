@@ -17,9 +17,13 @@ missing along the way:
 
 1. `ghq get` if the clone is absent, else `git fetch --prune`.
 2. Resolve the branch — argument, `/tree/<branch>` URL tail, PR head, or fzf.
-3. Reuse an existing worktree (fast-forwarding it), else `gwq add`.
-4. `git submodule update --init --recursive` when `.gitmodules` exists.
-5. Print the path; `--init <shell>` emits a function so the *shell* cds.
+3. For a new branch, use `origin/HEAD` as its base; for a PR, fetch its latest
+   head into the local review ref.
+4. Reuse an existing worktree and fast-forward it when possible, else `gwq add`.
+5. Optionally seed missing ignored files from the GHQ clone with
+   `--copy-ignored-files`.
+6. `git submodule update --init --recursive` when `.gitmodules` exists.
+7. Print the path; `--init <shell>` emits a function so the *shell* cds.
 
 Single source of behavior: `bin/gwqpull.mjs`.
 
@@ -137,13 +141,23 @@ constructed path used only for a repository that does not exist yet — and
 `ensureClone()` re-resolves *after* cloning, because which root `ghq get` picks
 is ghq's business, not ours.
 
+### I6c. New branches start at the remote default
+
+When the requested branch exists neither locally nor on `origin`, resolve the
+repository's default branch from `origin/HEAD` and create the new branch at
+`origin/<default>`. Never use the GHQ clone's current `HEAD`: that checkout may
+be on an unrelated feature branch. Existing local and remote branches keep
+their own history.
+
 ### I7. An existing worktree is never handed to `gwq add`
 
 That is where in-progress work lives. An existing worktree gets
-`git merge --ff-only origin/<branch>` and nothing else; a divergence or a dirty
-tree produces a **warning and a successful exit**, never a rewrite and never a
-hard failure. Losing someone's uncommitted work is worse than any convenience
-this tool offers.
+`git merge --ff-only origin/<branch>` for ordinary branches, or the latest
+`refs/gwqpull/pull/<number>/head` for PR URLs. Newly created worktrees receive
+the same fast-forward step after `gwq add`. A divergence or a dirty tree
+produces a **warning and a successful exit**, never a rewrite and never a hard
+failure. Losing someone's uncommitted work is worse than any convenience this
+tool offers.
 
 ### I8. `git worktree list` includes the main working tree
 
@@ -164,8 +178,22 @@ is a fallback for states git's porcelain does not cover, not the primary path.
   `refs/pull/N/head` into a local `pr-N`
 - **merged PR whose head branch was deleted** → same `pr-N` fallback
 
-The fork case must warn that no upstream is set. Collapsing these into "just use
-headRefName" breaks two of the three.
+All three fetch `refs/pull/N/head` into the stable internal ref
+`refs/gwqpull/pull/N/head`. The worktree is fast-forwarded from that ref on each
+normal invocation, so an existing review follows new commits pushed to the PR.
+Fallback branches also record an internal association in
+`refs/gwqpull/pull/N/branch`; an unrelated pre-existing `pr-N` branch is rejected
+instead of being advanced silently.
+The fork case must warn that no upstream is set. Collapsing these into "just
+use headRefName" breaks two of the three.
+
+### I9b. Copy ignored files only when explicitly requested
+
+`--copy-ignored-files` enumerates ignored, untracked paths using the GHQ clone's
+Git rules. It copies only paths missing from the destination, creates parent
+directories as needed, and never overwrites or deletes destination files.
+Ordinary untracked files are deliberately excluded. The option is independent
+of `--no-fetch` and never prompts.
 
 ### I10. Collisions are moved, never deleted
 
@@ -175,9 +203,9 @@ Without `-f` it is left alone and the error names it, says how many entries it
 holds, and points at `-f`. Never `rm` a collision — it may be someone's work.
 
 The destination path is recovered from gwq's error text. Prefer git's quoted
-`fatal: '<path>' already exists`; the command echo is the fallback and needs to
-be told whether `-b` was used, because that swaps the argument order
-(`add -b <branch> <path>` versus `add <path> <branch>`).
+`fatal: '<path>' already exists`; the command echo is the fallback. The parser
+understands both argument orders (`add -b <branch> <path>` and
+`add <path> <branch>`) because gwq versions can report either form.
 
 Two ways this has already been got wrong: a pattern that stopped at the first
 space read the path-first form correctly *by accident* and silently broke `-f`
@@ -187,22 +215,23 @@ path. Both orders, with and without spaces, are now tested.
 
 ### I10b. Roll back only the branch this run created
 
-`git worktree add -b` creates the branch while "preparing" and then dies on an
-occupied destination, leaving a branch with no worktree. The next run then fails
-with "branch already exists" and the tool stops being idempotent.
+The CLI creates a new branch at `origin/<default>` before invoking `gwq add` so
+the base is explicit. If `gwq add` then dies on an occupied destination, the
+branch can be left with no worktree. The next run would fail with "branch
+already exists" and the tool would stop being idempotent.
 
 This is easy to trigger by accident because gwq sanitises `/` to `-`: asking for
 `feat-template-rate-limit` targets the directory `feat/template-rate-limit`
 already occupies. It was found exactly that way, by fat-fingering a branch name
 during a smoke test.
 
-`rollbackBranch()` deletes it — but only when the branch did not exist before
-(`known`), and only when no worktree materialised after all. A branch the user
-already had may hold their work and is never touched. Both halves are tested;
-`gwqadd` carries the same rule and the same pair of tests.
+`rollbackBranch()` deletes it — but only when this invocation created the branch
+(`createdByUs`), and only when no worktree materialised after all. A branch the
+user already had may hold their work and is never touched. Both halves are
+tested; `gwqadd` carries the same rule and the same pair of tests.
 
-The `-f` retry must also notice a leftover branch and drop `-b`, or git refuses
-to create it twice.
+The `-f` retry reuses the already-created local branch; it does not try to create
+the branch a second time.
 
 ### I11. `--json` schema (external contract)
 
@@ -331,6 +360,9 @@ Covered: every spec-parsing shape, clone-on-demand, worktree creation for
 existing / origin-only / brand-new branches, idempotent re-runs, the I8
 main-clone case, the I10 collision paths (both with and without `-f`, asserting
 the stray file survives inside the backup), and the I1/I3 stdout contract.
+The suite also covers new branches starting from `origin/HEAD` when the main
+clone is on another branch, PR worktree refresh after a new head commit, and
+opt-in ignored-file seeding with missing-only preservation.
 
 Two traps for anyone adding tests:
 
@@ -352,9 +384,12 @@ Not covered — run by hand:
 | Branch picker | `gwqpull <repo>` | fzf lists local + origin branches |
 | Picker cancel | `gwqpull <repo>`, Esc | exit 130, shell stays put |
 | Real clone | `gwqpull cli/cli trunk` | clones from the network, lands in a worktree |
+| New branch base | check out another branch in the clone, then request a new branch | starts from `origin/HEAD` |
 | Same-repo PR | `gwqpull <url>/pull/<n>` | head ref checked out |
+| PR re-run | push another commit to the PR, run the same command | existing worktree fast-forwards when clean |
 | Fork PR | `gwqpull <fork-pr-url>` | `pr-N` branch, "no upstream" warning |
 | Deleted head PR | `gwqpull <merged-pr-url>` | `pr-N` fallback with a note |
+| Ignored files | `gwqpull --copy-ignored-files <repo> <branch>` | ignored config files copied; ordinary untracked files excluded |
 | Submodules | `gwqpull <repo-with-submodules>` | submodules populated |
 | Dirty worktree | edit a file, re-run | warns, does not rewrite (I7) |
 | Diverged branch | commit locally, re-run | warns, does not rewrite (I7) |
