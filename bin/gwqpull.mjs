@@ -883,7 +883,11 @@ function seedIgnoredFiles(sourceDir, destinationDir) {
   // aside itself (I4), or a worktree whose `.git` file went missing — and our
   // own `git worktree prune` runs before this, so that entry is already gone.
   // The directory the destination sits in is therefore pruned wholesale — one
-  // level, not gwq's whole basedir, which we have no way to ask for. With a
+  // level, not gwq's whole basedir. gwq does report that (`gwq config get
+  // worktree.basedir`, G5), but the value comes back unexpanded, it is the
+  // configured basedir rather than where this worktree actually went, and it
+  // costs another gwq start-up per run — and it would not change the case
+  // below, because those leftovers sit beside the destination. With a
   // naming template that nests (host/owner/repo/branch) a leftover further up
   // is still copied; that needs a layout change to happen at all, and taking
   // the topmost ancestor instead would prune a real config directory whenever

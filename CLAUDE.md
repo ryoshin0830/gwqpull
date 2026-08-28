@@ -297,7 +297,14 @@ ordinary ignored directory and a full checkout. So `dirname(destinationRoot)` �
 not gwq's basedir: with a nesting naming template a leftover higher up is still
 copied, which needs the template to have changed under an existing worktree, and
 pruning the topmost ancestor instead would eat a real config directory whenever
-the basedir sits inside one. See gwqadd's I25b for the measurement. The direction of
+the basedir sits inside one. See gwqadd's I25b for the measurement.
+
+gwq *does* report its basedir — `gwq config get worktree.basedir`, verified on
+v0.1.1 — and reaching for it would still not help: the value is unexpanded, it
+is the configured basedir rather than where this worktree went, it costs another
+gwq start-up per run, and the leftovers in question sit beside the destination
+anyway. gwqadd's G5 records this; the note here used to say the interface did
+not exist, which review disproved with one command. The direction of
 `isWithin(p, w)` in that loop looks backwards and is not: `worktrees` contains
 the main working tree, so the "obvious fix" prunes every entry and copies
 nothing. Keep the comment.
