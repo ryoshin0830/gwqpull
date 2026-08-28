@@ -292,8 +292,12 @@ by cpSync's own "cannot copy to a subdirectory of self"). `ownWorktrees()` reads
 fixed here too. git knows only the *live* worktrees; a `<path>.bak-<timestamp>`
 moved aside under `-f` (I10), or a worktree whose `.git` file went missing, is an
 ordinary ignored directory and a full checkout. So `dirname(destinationRoot)` —
-the directory gwq was told to put worktrees in — is pruned wholesale, guarded by
-`samePath(holder, dir)` for a basedir at the repository root. The direction of
+**the directory the destination sits in** — is pruned wholesale, guarded by
+`samePath(holder, dir)` for a basedir at the repository root. That is one level,
+not gwq's basedir: with a nesting naming template a leftover higher up is still
+copied, which needs the template to have changed under an existing worktree, and
+pruning the topmost ancestor instead would eat a real config directory whenever
+the basedir sits inside one. See gwqadd's I25b for the measurement. The direction of
 `isWithin(p, w)` in that loop looks backwards and is not: `worktrees` contains
 the main working tree, so the "obvious fix" prunes every entry and copies
 nothing. Keep the comment.

@@ -882,10 +882,13 @@ function seedIgnoredFiles(sourceDir, destinationDir) {
   // an ordinary ignored directory: a `<path>.bak-<timestamp>` this tool moved
   // aside itself (I4), or a worktree whose `.git` file went missing — and our
   // own `git worktree prune` runs before this, so that entry is already gone.
-  // The directory the destination sits in is therefore pruned wholesale. That
-  // is as structural as the worktree list: it is where gwq was told to put
-  // worktrees. The samePath guard is for a basedir at the repository root,
-  // where pruning the holder would prune everything.
+  // The directory the destination sits in is therefore pruned wholesale — one
+  // level, not gwq's whole basedir, which we have no way to ask for. With a
+  // naming template that nests (host/owner/repo/branch) a leftover further up
+  // is still copied; that needs a layout change to happen at all, and taking
+  // the topmost ancestor instead would prune a real config directory whenever
+  // someone points the basedir inside one. The samePath guard is for a basedir
+  // at the repository root, where pruning the holder would prune everything.
   const holder = dirname(destinationRoot);
   const holdsWorktrees = isWithin(sourceDir, holder) && !samePath(holder, sourceDir);
   const isOwnWorktree = (p) => {
