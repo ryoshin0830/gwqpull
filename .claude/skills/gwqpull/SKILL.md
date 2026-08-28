@@ -109,7 +109,8 @@ and reported as a conflict.
   "created":       true,
   "isMainClone":   false,
   "ignoredFiles":  { "copied": 6, "kept": 0, "skipped": 41932,
-                     "failed": 0, "error": null, "enabled": true },
+                     "failed": 0, "error": null, "enabled": true,
+                     "heldFor": null },
   "cd":            false
 }
 ```
@@ -133,7 +134,10 @@ and reported as a conflict.
   before building or testing.
   For a **fork PR** nothing is copied at all unless `--copy-ignored-files` is
   passed: it is third-party code, and the copy would hand it the user's
-  credentials. Do not pass that flag on the user's behalf.
+  credentials. `heldFor: "fork"` is how that shows up in the payload — tell the
+  user the worktree has no local configuration and why, and do not pass that
+  flag on their behalf. A PR whose `isCrossRepository` could not be read counts
+  as a fork here.
 
 Progress narrates on stderr, so parse stdout with `jq -r .path`. Tolerate
 unknown fields — the schema allows additive growth.

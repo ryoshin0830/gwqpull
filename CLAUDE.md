@@ -234,10 +234,25 @@ Four properties, all required, all tested:
   replaced the `die('E_WORKTREE', …)` the opt-in version used: a copy that the
   user explicitly asked for may fail loudly, one that happens on every run may
   not.
-- **It reports its own trouble.** `ignoredFiles` carries `failed` and `error`
-  for exactly that reason — see I11. Without them `{copied:0,kept:0,skipped:0}`
-  is both "no ignored files" and "the listing died", and `warn()` is silent in
-  `--json`.
+- **It reports its own trouble.** `ignoredFiles` carries `failed`, `error`,
+  `enabled` and `heldFor` for exactly that reason — see I11. Without them
+  `{copied:0,kept:0,skipped:0}` is "no ignored files", "the listing died",
+  "turned off" and "withheld for a fork PR" all at once, and `warn()` is silent
+  in `--json`.
+
+  Both extra fields came out of review, one round apart, and both for the same
+  reason: a path that returns a copy result without saying so is invisible to
+  `--json`. `enabled` covers "it never ran", whose counters were byte-identical
+  to a successful copy with nothing to do. `heldFor` says *why* — `"fork"`, or
+  null when the flag turned it off — because those want different reactions: the
+  fork case is a refusal to hand credentials to third-party code, which SKILL.md
+  tells agents not to override.
+
+  The fork gate itself reads `isCrossRepository !== false`, not `=== true`. Two
+  questions share that field: which branch to use is a feature decision and
+  needs a positive answer, while whether third-party code gets the user's `.env`
+  is a security decision. An unreadable answer therefore counts as a fork — a
+  wrong hold costs one flag, a wrong pass costs the keys.
 
 **A fork PR is the one place the default flips.** `isCrossRepository` means the
 worktree is a checkout of third-party code, and the review procedure *is*
@@ -249,9 +264,9 @@ wrong for someone else's code; SKILL.md tells agents not to pass that flag on
 the user's behalf.
 
 `cpSync` runs with `verbatimSymlinks: true`. Its default resolves a symlink
-before copying, which turns `node_modules/.bin/tsc -> ../typescript/bin/tsc`
-into an absolute path back into the clone — a worktree quietly wired to another
-checkout.
+before copying, which turns `.secrets/bin/key -> ../real/key` into an absolute
+path back into the clone — a worktree quietly wired to another checkout. The
+example used to be `node_modules/.bin/tsc`, which I9c makes unreachable.
 
 ### I9c. Dependency and build directories are excluded by name
 
@@ -272,6 +287,32 @@ indivisible entry — so worktrees copy each other, a level deeper on every run
 (measured in gwqadd: 4 → 12 → 28 files, nesting 15 components deep, stopped only
 by cpSync's own "cannot copy to a subdirectory of self"). `ownWorktrees()` reads
 `git worktree list --porcelain`.
+
+**The worktree list alone is not enough**, which review found in gwqadd and is
+fixed here too. git knows only the *live* worktrees; a `<path>.bak-<timestamp>`
+moved aside under `-f` (I10), or a worktree whose `.git` file went missing, is an
+ordinary ignored directory and a full checkout. So `dirname(destinationRoot)` —
+the directory gwq was told to put worktrees in — is pruned wholesale, guarded by
+`samePath(holder, dir)` for a basedir at the repository root. The direction of
+`isWithin(p, w)` in that loop looks backwards and is not: `worktrees` contains
+the main working tree, so the "obvious fix" prunes every entry and copies
+nothing. Keep the comment.
+
+`skipped N` counts **entries** — one file under `node_modules`, but one whole
+directory where git stops at a repository boundary. The unit is stable on
+purpose: reporting the count is what keeps the denylist honest.
+
+A denylist name in the middle of a real path takes the file with it —
+`config/tmp/app.conf` goes with the rest of `tmp`. There is no allowlist and no
+config file for that: nothing here can tell a kept file from a build artefact,
+and the run names the directories it skipped so the user can copy it by hand.
+`--help` and the README say so rather than leaving it to be discovered.
+
+An ignored **nested repository** is one entry of unbounded size, because git
+stops at the boundary: the progress counter cannot move inside it. It is copied
+whole, `.git` included, with a warning naming it — not excluded, since a
+`.secrets` that happens to be a repository is still the credential this exists
+for.
 
 There is no honest signal to use instead, and this was checked:
 
@@ -384,15 +425,21 @@ the branch a second time.
   "created":       true | false,
   "isMainClone":   true | false,
   "ignoredFiles":  { "copied": <n>, "kept": <n>, "skipped": <n>,
-                     "failed": <n>, "error": "<message>" | null },
+                     "failed": <n>, "error": "<message>" | null,
+                     "enabled": true | false, "heldFor": "fork" | null },
   "cd":            true | false
 }
 ```
 
 `ignoredFiles` is the only report the copy gets: it never touches the exit code,
-and `warn()` is silent in `--json`. The copy did its job iff `error` is null and
-`failed` is 0. `{copied:0,kept:0,skipped:0}` on its own says nothing — it is
-equally a repository with no ignored files and a listing that died (I9d).
+and `warn()` is silent in `--json`. The copy did its job iff `enabled` is true,
+`error` is null and `failed` is 0; `heldFor` says why it did not run.
+`{copied:0,kept:0,skipped:0}` on its own says nothing — it is equally a
+repository with no ignored files and a listing that died (I9d).
+
+Every entry git listed lands in exactly one of `copied`, `kept`, `failed` and
+`skipped` — including a source that vanished between the listing and the copy,
+which used to `continue` into none of them.
 
 Error (stderr, exit ≠ 0):
 
@@ -517,6 +564,13 @@ directory the test needs to replace with a symlink.
 
 Two traps for anyone adding tests:
 
+- **A clone made by the `ghq get` shim has no git identity.** It is a plain
+  `git clone`; only `seedDir` is configured. A test that commits inside the
+  clone must set `user.email` and `user.name` on it, or it passes or fails with
+  whatever the developer has globally — and since CI runs the suite only at
+  publish time, that failure would land on the release. Verified with
+  `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null npm test`, which is
+  the cheap way to check hermeticity.
 - **Realpath the sandbox root.** macOS `$TMPDIR` is `/var/...` symlinked to
   `/private/var/...`, git reports the resolved form, and unresolved
   expectations will never match.
@@ -546,6 +600,10 @@ Not covered — run by hand:
 | Ignored copy, huge listing | a clone with `npm install` run in it | the config files still arrive; `ignoredFiles.error` is null (I9d) |
 | Fork PR copy | `gwqpull <fork-pr-url>` | nothing copied, and the warning names `--copy-ignored-files` |
 | Fork PR copy, forced | add `--copy-ignored-files` | copied |
+| Ignored copy, leftover beside the worktrees | `-f` a collision, then re-run | the `.bak-` is not copied into the new worktree |
+| Ignored copy, global excludes | `core.excludesFile` matching a local file | it is copied — `--exclude-standard` includes it |
+| Ignored copy, nested repository | an ignored directory that is itself a git repo | copied whole with a warning naming it |
+| Fork PR, unreadable `gh` output | a `gh` that omits `isCrossRepository` | the copy is withheld; the branch is unaffected |
 | Submodules | `gwqpull <repo-with-submodules>` | submodules populated |
 | Dirty worktree | edit a file, re-run | warns, does not rewrite (I7) |
 | Diverged branch | commit locally, re-run | warns, does not rewrite (I7) |

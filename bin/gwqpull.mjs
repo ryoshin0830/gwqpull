@@ -6,7 +6,7 @@ import {
   readFileSync, existsSync, readdirSync, renameSync, realpathSync,
   cpSync, lstatSync, mkdirSync,
 } from 'node:fs';
-import { dirname, resolve, sep } from 'node:path';
+import { dirname, resolve, sep, join as joinPath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Read from package.json rather than a hand-maintained constant: `npm version`
@@ -114,6 +114,12 @@ IGNORED FILES
 
     git -C <clone> ls-files --others --ignored --exclude-standard
 
+  A real file that lives under one of those names is not copied either —
+  config/tmp/app.conf goes with the rest of tmp. Bring it over by hand (cp) when
+  a project keeps something real there; nothing here can tell it apart from a
+  build artefact. An ignored nested repository is copied whole, .git included,
+  and says so, because git reports it as one entry of any size.
+
   Nothing is ever overwritten or deleted: a file the destination already has is
   left exactly as it is, so re-running is safe and a .env you edited in a review
   worktree stays yours. A copy that fails is a warning, not a failure — the
@@ -130,15 +136,15 @@ OUTPUT
     {"schemaVersion":1,"path":"…","branch":"…","clone":"…","repo":{…},
      "pr":null,"created":true,"isMainClone":false,
      "ignoredFiles":{"copied":0,"kept":0,"skipped":0,"failed":0,"error":null,
-                     "enabled":true},
+                     "enabled":true,"heldFor":null},
      "cd":true}
 
   The copy did everything it set out to do when ignoredFiles.enabled is true,
   ignoredFiles.error is null and ignoredFiles.failed is 0. enabled is false when
-  it never ran — turned off, or withheld for a fork PR — whose counters are
-  otherwise identical to a repository with nothing to copy. The copy never
-  affects the exit code, and in --json this payload is the only place its
-  trouble is reported.
+  it never ran, and heldFor says why: "fork" for a fork PR, null when the flag
+  turned it off. Those counters are otherwise identical to a repository with
+  nothing to copy. The copy never affects the exit code, and in --json this
+  payload is the only place its trouble is reported.
 
   On error in --json mode, stdout is empty and stderr gets:
     {"schemaVersion":1,"error":{"code":"E_CLONE","message":"…"},"exitCode":1}
@@ -715,8 +721,13 @@ function defaultBranch(dir) {
 // exists because {copied:0,kept:0,skipped:0,failed:0,error:null} was identical
 // to a successful copy of a repository with no ignored files, and an agent
 // following "error is null and failed is 0" would then believe the .env is there.
-const noCopy = () => ({
-  copied: 0, kept: 0, skipped: 0, failed: 0, error: null, enabled: false,
+// `heldFor` carries *why* it did not run. `enabled: false` alone told a caller
+// that the copy was not attempted, but not whether the user turned it off or a
+// fork PR withheld it — and those want different reactions: the second is a
+// deliberate refusal to hand credentials to third-party code, and SKILL.md tells
+// agents not to override it on the user's behalf.
+const noCopy = (heldFor = null) => ({
+  copied: 0, kept: 0, skipped: 0, failed: 0, error: null, enabled: false, heldFor,
 });
 
 function pathExists(path) {
@@ -826,7 +837,8 @@ function seedIgnoredFiles(sourceDir, destinationDir) {
   // {copied:0,kept:0,skipped:0} is otherwise indistinguishable from a
   // repository that simply has no ignored files.
   const result = {
-    copied: 0, kept: 0, skipped: 0, failed: 0, error: null, enabled: true,
+    copied: 0, kept: 0, skipped: 0, failed: 0, error: null,
+    enabled: true, heldFor: null,
   };
   if (samePath(sourceDir, destinationDir)) return result;
 
@@ -926,7 +938,12 @@ function seedIgnoredFiles(sourceDir, destinationDir) {
       skip(`${entry} (escapes the worktree)`);
       continue;
     }
-    if (!pathExists(sourcePath)) continue;
+    if (!pathExists(sourcePath)) {
+      // Counted, not skipped silently: `ignoredFiles` is the only report this
+      // copy gets, so every entry has to land in one of its numbers.
+      skip(`${entry} (disappeared between the listing and the copy)`);
+      continue;
+    }
     if (pathExists(destinationPath)) {
       result.kept++;
       continue;
@@ -949,6 +966,13 @@ function seedIgnoredFiles(sourceDir, destinationDir) {
       // copied. Resolving it, which is cpSync's default, rewrites
       // `.secrets/bin/key -> ../real/key` into an absolute path back into
       // the clone. (Not a node_modules example: I25b never copies those.)
+      // git stops at a repository boundary, so an ignored nested repository is
+      // a single entry of unbounded size and the counter cannot move inside it.
+      // Not excluded — a `.secrets` that happens to be a repository is still
+      // the credential the copy exists for — but never silent either.
+      if (pathExists(joinPath(sourcePath, '.git'))) {
+        warn(`${entry} is a nested repository — copying it whole, .git included`);
+      }
       cpSync(sourcePath, destinationPath,
         { recursive: true, force: false, verbatimSymlinks: true });
       result.copied++;
@@ -1258,6 +1282,12 @@ async function resolvePrBranch(dir, url, prNumber, host) {
     return true;
   };
 
+  // Two different questions share this field. Which branch to use is a feature
+  // decision and needs a positive answer; whether to hand this checkout the
+  // user's credentials is a security decision, so anything that is not a clear
+  // "same repository" counts as a fork (see the copy gate in main()).
+  const fork = pr.isCrossRepository !== false;
+
   if (pr.isCrossRepository === true) {
     const branch = `pr-${prNumber}`;
     const managed = materialisePrBranch(branch,
@@ -1266,11 +1296,11 @@ async function resolvePrBranch(dir, url, prNumber, host) {
       die('E_PR', `local branch ${branch} already exists and is not associated with PR #${prNumber}`);
     }
     warn(`fork PR — no upstream is set. Pushing needs the fork added as a remote.`);
-    return { branch, sourceRef: cachedRef, associationRef, fork: true };
+    return { branch, sourceRef: cachedRef, associationRef, fork };
   }
 
   if (hasLocalBranch(dir, pr.headRefName) || hasRemoteBranch(dir, pr.headRefName)) {
-    return { branch: pr.headRefName, sourceRef: cachedRef };
+    return { branch: pr.headRefName, sourceRef: cachedRef, fork };
   }
 
   const branch = `pr-${prNumber}`;
@@ -1280,7 +1310,7 @@ async function resolvePrBranch(dir, url, prNumber, host) {
     die('E_PR', `local branch ${branch} already exists and is not associated with PR #${prNumber}`);
   }
   warn(`${pr.headRefName} is gone from the remote — fetched it as ${branch} instead`);
-  return { branch, sourceRef: cachedRef, associationRef };
+  return { branch, sourceRef: cachedRef, associationRef, fork };
 }
 
 // A collision's destination has to be recovered from gwq's error text. Two
@@ -1502,7 +1532,7 @@ async function main() {
   }
   const ignoredFiles = copyIgnored && !forkHold
     ? seedIgnoredFiles(dir, wt.path)
-    : noCopy();
+    : noCopy(forkHold ? 'fork' : null);
 
   if (doSubmodules && existsSync(`${wt.path}/.gitmodules`)) {
     log(`${dim('│')} initialising submodules`);

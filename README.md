@@ -214,6 +214,13 @@ off, or withheld for a fork PR.
 The worktree therefore has no `node_modules`: run the project's install step
 there before building or testing.
 
+A real file that lives under one of those names is not copied either —
+`config/tmp/app.conf` goes with the rest of `tmp`. Copy it over by hand when a
+project keeps something real there: nothing in this tool can tell it apart from
+a build artefact, and every run names the directories it skipped so you can see
+it happened. An ignored *nested repository* is copied whole, `.git` included,
+and says so — git reports it as one entry whatever its size.
+
 `--no-copy-ignored-files` turns it off. `--copy-ignored-files` is the default and
 is accepted so a script can say so out loud.
 
