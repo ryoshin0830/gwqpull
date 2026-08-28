@@ -154,10 +154,27 @@ their own history.
 That is where in-progress work lives. An existing worktree gets
 `git merge --ff-only origin/<branch>` for ordinary branches, or the latest
 `refs/gwqpull/pull/<number>/head` for PR URLs. Newly created worktrees receive
-the same fast-forward step after `gwq add`. A divergence or a dirty tree
-produces a **warning and a successful exit**, never a rewrite and never a hard
+the same fast-forward step after `gwq add`. A divergence or local changes
+produce a **warning and a successful exit**, never a rewrite and never a hard
 failure. Losing someone's uncommitted work is worse than any convenience this
 tool offers.
+
+**The gate reads `--untracked-files=no`, and that is deliberate.** It used to be
+`--untracked-files=all`, which stopped working the moment the ignored-file copy
+became the default (I9b): `.gitignore` is tracked, so it differs per branch, and
+a file the clone ignores lands in a worktree whose branch predates that rule as
+an ordinary untracked file. gwqpull thus dirtied the tree itself and then refused
+to follow the PR head for the rest of that worktree's life — under a `✓`.
+
+Untracked files are not at risk from the relaxation, which was verified against
+git rather than assumed: `merge --ff-only` refuses on its own, and leaves the
+file alone, when the merge would overwrite an untracked file; an unrelated
+untracked file does not block it. Tracked modifications still do.
+
+The test for this needs a **tracked** `.gitignore` difference between the clone's
+checkout and the worktree's branch. `.git/info/exclude` cannot express it: it
+lives in the common git dir, so every worktree of the repository shares it — the
+first version of that test passed against the bug for exactly this reason.
 
 ### I8. `git worktree list` includes the main working tree
 
@@ -202,7 +219,7 @@ It shipped opt-in in 0.1.7 and that was the wrong default: the user who asked
 for the feature hit the same empty worktree again on the next repository,
 because the fix was a flag they had to remember. 0.2.0 flipped it.
 
-Three properties, all required, all tested:
+Four properties, all required, all tested:
 
 - **Missing-only, never destructive.** A path the destination already has is
   counted as kept and left alone, so a review-specific `.env` survives and
@@ -217,6 +234,24 @@ Three properties, all required, all tested:
   replaced the `die('E_WORKTREE', …)` the opt-in version used: a copy that the
   user explicitly asked for may fail loudly, one that happens on every run may
   not.
+- **It reports its own trouble.** `ignoredFiles` carries `failed` and `error`
+  for exactly that reason — see I11. Without them `{copied:0,kept:0,skipped:0}`
+  is both "no ignored files" and "the listing died", and `warn()` is silent in
+  `--json`.
+
+**A fork PR is the one place the default flips.** `isCrossRepository` means the
+worktree is a checkout of third-party code, and the review procedure *is*
+`npm install && npm test` — so the copy would put `.env`, `.npmrc` and
+service-account keys in front of whatever a postinstall script decides to do.
+Nothing is copied there unless `--copy-ignored-files` says so explicitly, and
+the warning names the flag. On by default is right for your own repositories and
+wrong for someone else's code; SKILL.md tells agents not to pass that flag on
+the user's behalf.
+
+`cpSync` runs with `verbatimSymlinks: true`. Its default resolves a symlink
+before copying, which turns `node_modules/.bin/tsc -> ../typescript/bin/tsc`
+into an absolute path back into the clone — a worktree quietly wired to another
+checkout.
 
 ### I9c. Dependency and build directories are excluded by name
 
@@ -228,7 +263,15 @@ interleaves two dependency trees — worse than an empty one. A `.next` cache
 carries absolute paths and is wrong the moment it moves.
 
 So `REGENERABLE_DIRS` excludes a path whose **parent components** contain one of
-46 names. Only parents count: a file called `dist` is a file.
+46 names, at any depth. Only parents count: a file called `dist` is a file.
+
+**This repository's own worktrees are excluded too, and that one is not a
+guess.** With gwq's basedir inside the clone, every worktree is an ignored
+directory of the repository, and git reports a wholly-ignored directory as one
+indivisible entry — so worktrees copy each other, a level deeper on every run
+(measured in gwqadd: 4 → 12 → 28 files, nesting 15 components deep, stopped only
+by cpSync's own "cannot copy to a subdirectory of self"). `ownWorktrees()` reads
+`git worktree list --porcelain`.
 
 There is no honest signal to use instead, and this was checked:
 
@@ -260,6 +303,35 @@ file inside `node_modules` and there can be hundreds of thousands of them.
 
 `gwqadd` carries the same behaviour (its I25), sharing the implementation by
 copy rather than by dependency (I13 — zero runtime dependencies).
+
+### I9d. The listing must never be truncated
+
+`spawnSync`'s default `maxBuffer` is 1 MiB, and `git ls-files --others --ignored
+--exclude-standard -z` is bounded by the **total length of the path names**, so
+any clone that has had `npm install` run in it goes past it. Measured:
+
+| ignored entries | `-z` bytes | before the fix |
+| --- | --- | --- |
+| 3,002 | 876 KB | `.env` lands |
+| 8,002 | 2.3 MB | `status:null signal:SIGTERM error:ENOBUFS`, **nothing copied** |
+
+A bare Next.js app (`next react react-dom typescript eslint vitest`) measured
+21,420 entries / 1.26 MB, so it was already over. Truncation surfaced as
+`status !== 0`, which fell into the "could not list" warning — silent in
+`--json`, so the whole feature disappeared without a trace, `.env` included, and
+0.1.7's `die` had at least been loud about it. `git()` therefore passes
+`maxBuffer: 512 * 1024 * 1024` for every call.
+
+**I9c does not save this.** Pruning happens after git returns, so the listing
+dies first; excluding `node_modules` by name makes the failure *quieter*, not
+less likely.
+
+The test builds a fixture whose listing exceeds 1 MiB on purpose and asserts the
+config file still arrives. The harness's own `git()` helper needed the same
+`maxBuffer` to measure that fixture, which is how loudly this fails.
+
+The listing failure now names its reason (`ENOBUFS`, a signal, or the exit
+code); "could not list" alone was indistinguishable from an empty result.
 
 ### I10. Collisions are moved, never deleted
 
@@ -311,9 +383,16 @@ the branch a second time.
   "pr":            <number> | null,
   "created":       true | false,
   "isMainClone":   true | false,
+  "ignoredFiles":  { "copied": <n>, "kept": <n>, "skipped": <n>,
+                     "failed": <n>, "error": "<message>" | null },
   "cd":            true | false
 }
 ```
+
+`ignoredFiles` is the only report the copy gets: it never touches the exit code,
+and `warn()` is silent in `--json`. The copy did its job iff `error` is null and
+`failed` is 0. `{copied:0,kept:0,skipped:0}` on its own says nothing — it is
+equally a repository with no ignored files and a listing that died (I9d).
 
 Error (stderr, exit ≠ 0):
 
@@ -464,6 +543,9 @@ Not covered — run by hand:
 | Ignored files | `gwqpull <repo> <branch>` | ignored config files copied without asking; ordinary untracked files excluded |
 | Ignored copy, big tree | a clone with `node_modules` installed | `node_modules` is skipped and named in the summary |
 | Ignored files off | `gwqpull --no-copy-ignored-files <repo> <branch>` | nothing copied |
+| Ignored copy, huge listing | a clone with `npm install` run in it | the config files still arrive; `ignoredFiles.error` is null (I9d) |
+| Fork PR copy | `gwqpull <fork-pr-url>` | nothing copied, and the warning names `--copy-ignored-files` |
+| Fork PR copy, forced | add `--copy-ignored-files` | copied |
 | Submodules | `gwqpull <repo-with-submodules>` | submodules populated |
 | Dirty worktree | edit a file, re-run | warns, does not rewrite (I7) |
 | Diverged branch | commit locally, re-run | warns, does not rewrite (I7) |

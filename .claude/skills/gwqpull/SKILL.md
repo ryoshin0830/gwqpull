@@ -123,8 +123,14 @@ and reported as a conflict.
   config) were copied in from `clone`, how many the worktree already had and
   kept, and how many were `skipped` for living in a dependency or build
   directory (`node_modules`, `.venv`, `dist`, … — `gwqpull --help` lists all 46).
+  **The copy did its job iff `error` is null and `failed` is 0** — it never
+  affects `exitCode`, and in `--json` this is the only place its trouble is
+  reported, so check it rather than the exit code or stderr.
   **The worktree has no `node_modules`** — run the project's install step there
   before building or testing.
+  For a **fork PR** nothing is copied at all unless `--copy-ignored-files` is
+  passed: it is third-party code, and the copy would hand it the user's
+  credentials. Do not pass that flag on the user's behalf.
 
 Progress narrates on stderr, so parse stdout with `jq -r .path`. Tolerate
 unknown fields — the schema allows additive growth.

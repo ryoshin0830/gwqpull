@@ -9,6 +9,13 @@
 > Requirement 6's scope narrowed with it: dependency and build directories
 > (`node_modules`, `.venv`, `dist`, …) are excluded by name, because copying them
 > is slow and a half-filled `node_modules` is worse than an empty one. See I9c.
+>
+> Two more requirements moved. Requirement 4's dirty check now reads
+> `--untracked-files=no` (I7): the copy itself creates untracked files in a
+> worktree whose branch has a different `.gitignore`, so the old gate refused to
+> fast-forward review worktrees the tool had dirtied itself. And a fork PR gets
+> no copy at all unless `--copy-ignored-files` is passed, because a copy the
+> user did not ask for should not hand credentials to third-party code (I9b).
 > Everything else in this document still describes the shipped behaviour.
 
 ## Goal

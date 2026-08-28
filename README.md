@@ -101,7 +101,9 @@ the branch and the worktree already existed.
   checkout. An existing branch keeps its own history.
 - An existing worktree is never handed to `gwq add`. It gets a `--ff-only`
   merge from `origin/<branch>` or the latest PR head, and a divergence or a
-  dirty tree is a warning, not a rewrite.
+  tracked local change is a warning, not a rewrite. Untracked files neither
+  block that merge nor are lost to it — git refuses on its own when the merge
+  would overwrite one.
 - A fallback `pr-N` branch is updated only when it was created and associated
   by `gwqpull`; an unrelated local `pr-N` branch fails with an actionable error.
 - The ignored-file copy never overwrites an existing destination file and never
@@ -121,7 +123,8 @@ gwqpull [options] <repo|URL|PR-URL> [branch]
 | `--cmd <name>` | function name emitted by `--init` (default: `gwqpull`) |
 | `--no-fetch` | skip `git fetch` and the ff-only catch-up |
 | `--no-submodules` | skip `git submodule update --init --recursive` |
-| `--no-copy-ignored-files` | do not copy the clone's Git-ignored files across |
+| `--copy-ignored-files` | copy the clone's Git-ignored files in (the default; the opt-in a fork PR needs) |
+| `--no-copy-ignored-files` | do not copy them |
 | `-f`, `--force` | move a colliding worktree directory aside instead of failing |
 | `-n`, `--no-cd` | do the work and report the path, but do not move the shell |
 | `--json` | stdout = 1-line JSON |
@@ -177,9 +180,27 @@ out  site-packages  target  tmp  vendor  venv
 
 Ordinary untracked files are never copied either.
 
+The worktrees of this repository are skipped as well — a reading of `git
+worktree list` rather than a guess, and it matters when gwq's basedir lives
+inside the clone, where worktrees would otherwise copy each other. Relative
+symlinks stay relative, so a copied `node_modules/.bin/tsc` cannot end up
+pointing back into the clone.
+
+**A fork PR is the exception to the default.** It is a checkout of third-party
+code that you are about to run — `npm install && npm test` *is* the review — so
+nothing is copied there unless you ask:
+
+```console
+$ gwqpull https://github.com/cli/cli/pull/9421
+gwqpull: fork PR — the ignored files were not copied. Pass --copy-ignored-files
+         to put your local configuration into third-party code.
+```
+
 Existing files in the worktree are kept, so a review-specific environment file
 is never overwritten and re-running is a no-op. A copy that fails is a warning,
-never a failed run: the worktree is reported either way.
+never a failed run: the worktree is reported either way. In `--json` that
+trouble is reported in the payload instead — the copy did its job when
+`ignoredFiles.error` is null and `ignoredFiles.failed` is 0.
 
 The worktree therefore has no `node_modules`: run the project's install step
 there before building or testing.
