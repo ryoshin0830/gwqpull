@@ -354,6 +354,27 @@ test('help documents default-branch and ignored-file behavior', () => {
   assert.match(r.stdout, /origin\/HEAD/);
   assert.match(r.stdout, /--copy-ignored-files/);
   assert.match(r.stdout, /--no-copy-ignored-files/);
+  // The exclusion list is only honest if it is written down where it is used.
+  assert.match(r.stdout, /node_modules/);
+  assert.match(r.stdout, /\.venv/);
+  assert.match(r.stdout, /\.terraform/);
+});
+
+test('every excluded directory name is listed in --help', () => {
+  const source = readFileSync(BIN, 'utf8');
+  const m = source.match(/const REGENERABLE_DIRS = \[([^\]]*)\]/);
+  assert.ok(m, 'REGENERABLE_DIRS not found in bin/gwqpull.mjs');
+  const names = m[1].split(',').map((x) => x.trim().replace(/^'|'$/g, '')).filter(Boolean);
+  assert.ok(names.length > 20, `only ${names.length} names parsed`);
+  assert.deepEqual([...names].sort(), names, 'REGENERABLE_DIRS is not sorted');
+  assert.equal(new Set(names).size, names.length, 'REGENERABLE_DIRS has duplicates');
+
+  // An exclusion nobody can read is a silent surprise the first time a project
+  // keeps something real in one of these. --help is where it has to be visible.
+  const help = run(['--help']).stdout;
+  for (const name of names) {
+    assert.ok(help.includes(name), `--help does not mention ${name}`);
+  }
 });
 
 test('a new branch starts from the default branch, not main clone HEAD', () => {
@@ -439,7 +460,51 @@ test('ignored files are seeded by default, without overwriting', () => {
   writeFileSync(join(j.path, '.env'), 'API_URL=https://review.example\n');
   const again = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
   assert.equal(readFileSync(join(j.path, '.env'), 'utf8'), 'API_URL=https://review.example\n');
-  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 2 });
+  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 2, skipped: 0 });
+});
+
+test('dependency and build directories are skipped, config files are not', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, '.env'), 'API_URL=https://local.example\n');
+  mkdirSync(join(clone, 'ignored-dir'), { recursive: true });
+  writeFileSync(join(clone, 'ignored-dir', 'nested.txt'), 'nested ignored\n');
+  // The fixture's .gitignore only covers *.env and ignored-dir/; these have to
+  // be ignored too, or they would be plain untracked files and never in scope.
+  writeFileSync(join(clone, '.git', 'info', 'exclude'),
+    'node_modules/\n.venv/\ndist/\nweb/.next/\n');
+  for (const [d, f] of [
+    ['node_modules/pkg', 'index.js'],
+    ['.venv/lib', 'site.py'],
+    ['dist', 'bundle.js'],
+    ['web/.next/cache', 'chunk.js'],
+  ]) {
+    mkdirSync(join(clone, d), { recursive: true });
+    writeFileSync(join(clone, d, f), 'regenerable\n');
+  }
+
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  assert.equal(readFileSync(join(j.path, '.env'), 'utf8'), 'API_URL=https://local.example\n');
+  assert.equal(readFileSync(join(j.path, 'ignored-dir', 'nested.txt'), 'utf8'), 'nested ignored\n');
+  for (const p of ['node_modules', '.venv', 'dist', 'web/.next']) {
+    assert.ok(!existsSync(join(j.path, p)), `${p} must not be copied`);
+  }
+  assert.deepEqual(j.ignoredFiles, { copied: 2, kept: 0, skipped: 4 });
+});
+
+test('the skipped directories are named on stderr', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, '.git', 'info', 'exclude'), 'node_modules/\n');
+  mkdirSync(join(clone, 'node_modules', 'pkg'), { recursive: true });
+  writeFileSync(join(clone, 'node_modules', 'pkg', 'index.js'), 'regenerable\n');
+
+  const r = run(['--quiet', '-n', '--no-fetch', 'alice/api', 'feat/login']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /skipped 1/);
+  assert.match(r.stderr, /node_modules/);
 });
 
 test('--no-copy-ignored-files leaves the worktree without them', () => {
@@ -473,7 +538,7 @@ test('--json reports what the copy did', () => {
   writeFileSync(join(clone, '.env'), 'API_URL=https://local.example\n');
 
   const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
-  assert.deepEqual(j.ignoredFiles, { copied: 1, kept: 0 });
+  assert.deepEqual(j.ignoredFiles, { copied: 1, kept: 0, skipped: 0 });
 });
 
 test('a symlinked destination parent is skipped, not followed or fatal', () => {
@@ -494,7 +559,8 @@ test('a symlinked destination parent is skipped, not followed or fatal', () => {
 
   const again = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
   assert.equal(again.path, j.path, 'the worktree is still reported, not an error');
-  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 0 }, 'the entry is skipped, not copied');
+  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 0, skipped: 0 },
+    'the entry is skipped, not copied');
   assert.ok(!existsSync(join(outside, 'nested.txt')), 'copy must not follow a destination symlink');
 });
 

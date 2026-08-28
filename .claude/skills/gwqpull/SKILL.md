@@ -108,7 +108,7 @@ and reported as a conflict.
   "pr":            null,
   "created":       true,
   "isMainClone":   false,
-  "ignoredFiles":  { "copied": 37, "kept": 0 },
+  "ignoredFiles":  { "copied": 6, "kept": 0, "skipped": 41932 },
   "cd":            false
 }
 ```
@@ -120,8 +120,11 @@ and reported as a conflict.
   land in the user's primary checkout.
 - `pr` — the PR number when a PR URL was given.
 - `ignoredFiles` — how many Git-ignored files (`.env`, credentials, local
-  config) were copied in from `clone`, and how many the worktree already had and
-  kept.
+  config) were copied in from `clone`, how many the worktree already had and
+  kept, and how many were `skipped` for living in a dependency or build
+  directory (`node_modules`, `.venv`, `dist`, … — `gwqpull --help` lists all 46).
+  **The worktree has no `node_modules`** — run the project's install step there
+  before building or testing.
 
 Progress narrates on stderr, so parse stdout with `jq -r .path`. Tolerate
 unknown fields — the schema allows additive growth.

@@ -153,21 +153,36 @@ are copied over from the GHQ clone, by default:
 ```console
 $ gwqpull https://github.com/cli/cli/pull/9421
 │ copying ignored files from /Users/you/ghq/github.com/cli/cli
-│ copied 37 ignored file(s)
+│ copied 6 ignored file(s), skipped 41932 in node_modules, .next
 ```
 
-Everything `git ls-files --others --ignored` reports is in scope, `node_modules`
-and build output included, so a big tree takes a moment — there is a counter
-while it runs. Ordinary untracked files are never copied.
+Dependency and build directories are **not** copied. They are reproducible from
+what git does track, and copying one is slow and frequently wrong — a `.next`
+cache carries absolute paths, and a half-filled `node_modules` is worse than an
+empty one. git has no idea which ignored paths are regenerable: `--directory`
+only tells you a directory is ignored as a whole, and that is just as true of
+`.secrets/`, while a size budget would give a different answer on every machine.
+So the exclusion is by name, the list is fixed, and every run says how many
+files it skipped and which of these they were in:
+
+```
+.angular  .astro  .cache  .dart_tool  .direnv  .docusaurus  .eggs  .gradle
+.mypy_cache  .next  .nuxt  .nyc_output  .output  .parcel-cache  .pnpm-store
+.pytest_cache  .ruff_cache  .sass-cache  .serverless  .stack-work
+.svelte-kit  .terraform  .terragrunt-cache  .tox  .turbo  .venv
+.virtualenvs  .vite  .yarn  Carthage  Pods  __pycache__  _build
+bower_components  build  coverage  deps  dist  jspm_packages  node_modules
+out  site-packages  target  tmp  vendor  venv
+```
+
+Ordinary untracked files are never copied either.
 
 Existing files in the worktree are kept, so a review-specific environment file
 is never overwritten and re-running is a no-op. A copy that fails is a warning,
 never a failed run: the worktree is reported either way.
 
-One consequence worth knowing: on a worktree that already has its own
-`node_modules`, filling in only what is missing mixes two installs. That is
-harmless for `.env` and awkward for a dependency tree, so reinstall there if
-anything looks strange — or pass `--no-copy-ignored-files` for that run.
+The worktree therefore has no `node_modules`: run the project's install step
+there before building or testing.
 
 `--no-copy-ignored-files` turns it off. `--copy-ignored-files` is the default and
 is accepted so a script can say so out loud.
@@ -181,8 +196,9 @@ $ gwqpull --json -n cli/cli trunk
 
 `created` says whether this run made the worktree; `isMainClone` says the branch
 was already checked out in the main clone, so no worktree was needed;
-`ignoredFiles` reports how many Git-ignored files were copied in from the clone
-and how many the worktree already had and kept.
+`ignoredFiles` reports how many Git-ignored files were copied in from the clone,
+how many the worktree already had and kept, and how many were `skipped` for
+living in a dependency or build directory.
 
 Progress narrates on stderr, so stdout stays parseable. Errors go to stderr as
 JSON with stdout empty:

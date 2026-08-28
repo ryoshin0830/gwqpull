@@ -76,11 +76,25 @@ IGNORED FILES
   .env, no credentials, no local config, so nothing that would let the project
   run. They are copied over from the GHQ clone.
 
-  Everything \`git ls-files --others --ignored\` reports is copied, node_modules
-  and build output included. Nothing is ever overwritten or deleted: a file the
-  destination already has is left exactly as it is, so re-running is safe and a
-  .env you edited in a review worktree stays yours. A copy that fails is a
-  warning, not a failure — the worktree is reported either way.
+  Dependency and build directories are skipped: they are reproducible from what
+  git does track, and copying one is slow and often wrong. git cannot tell them
+  from an .env, so the exclusion is by name:
+
+    .angular  .astro  .cache  .dart_tool  .direnv  .docusaurus  .eggs
+    .gradle  .mypy_cache  .next  .nuxt  .nyc_output  .output
+    .parcel-cache  .pnpm-store  .pytest_cache  .ruff_cache  .sass-cache
+    .serverless  .stack-work  .svelte-kit  .terraform  .terragrunt-cache
+    .tox  .turbo  .venv  .virtualenvs  .vite  .yarn  Carthage  Pods
+    __pycache__  _build  bower_components  build  coverage  deps  dist
+    jspm_packages  node_modules  out  site-packages  target  tmp  vendor
+    venv
+
+  Every run says how many files it skipped and which of these they were in.
+
+  Nothing is ever overwritten or deleted: a file the destination already has is
+  left exactly as it is, so re-running is safe and a .env you edited in a review
+  worktree stays yours. A copy that fails is a warning, not a failure — the
+  worktree is reported either way.
 
   --no-copy-ignored-files turns it off. --copy-ignored-files is the default and
   is accepted so a script can say so out loud.
@@ -684,6 +698,33 @@ function hasSymlinkInPath(root, candidate) {
   return false;
 }
 
+// Ignored paths a package manager or a build tool puts back on its own. git
+// cannot tell these from an .env: `--directory` only says a directory is
+// ignored as a whole, which is just as true of `.secrets/`, and a size budget
+// would change the answer with the state of the disk. The only honest
+// discriminator is the name, so the list is fixed, sorted, reproduced in
+// --help, and every run says how much it skipped and where.
+const REGENERABLE_DIRS = [
+  '.angular', '.astro', '.cache', '.dart_tool', '.direnv', '.docusaurus',
+  '.eggs', '.gradle', '.mypy_cache', '.next', '.nuxt', '.nyc_output',
+  '.output', '.parcel-cache', '.pnpm-store', '.pytest_cache', '.ruff_cache',
+  '.sass-cache', '.serverless', '.stack-work', '.svelte-kit', '.terraform',
+  '.terragrunt-cache', '.tox', '.turbo', '.venv', '.virtualenvs', '.vite',
+  '.yarn', 'Carthage', 'Pods', '__pycache__', '_build', 'bower_components',
+  'build', 'coverage', 'deps', 'dist', 'jspm_packages', 'node_modules',
+  'out', 'site-packages', 'target', 'tmp', 'vendor', 'venv',
+];
+const REGENERABLE = new Set(REGENERABLE_DIRS);
+
+// The name of the regenerable directory this entry lives in, or ''. Only parent
+// components count: a file called `dist` is a file, not a build directory.
+function regenerableDir(entry) {
+  const parts = entry.split('/');
+  parts.pop();
+  for (const part of parts) if (REGENERABLE.has(part)) return part;
+  return '';
+}
+
 // A worktree gets everything git tracks and nothing it does not, so it starts
 // without the .env and the credentials the project needs to run. Those live in
 // the clone; copy over the ones the destination lacks.
@@ -697,7 +738,7 @@ function hasSymlinkInPath(root, candidate) {
 //     with it, but a worktree that was not reported is worse than both, so
 //     every failure here is a warning.
 function seedIgnoredFiles(sourceDir, destinationDir) {
-  const result = { copied: 0, kept: 0 };
+  const result = { copied: 0, kept: 0, skipped: 0 };
   if (samePath(sourceDir, destinationDir)) return result;
 
   let destinationRoot;
@@ -719,7 +760,18 @@ function seedIgnoredFiles(sourceDir, destinationDir) {
   const entries = (r.stdout ?? '').split('\0').filter(Boolean);
   if (!entries.length) return result;
 
-  log(`${dim('│')} copying ignored files from ${dim(sourceDir)}`);
+  // Prune before touching the filesystem: git lists every single file inside
+  // node_modules, and there can be hundreds of thousands of them.
+  const pruned = new Map();
+  const wanted = [];
+  for (const entry of entries) {
+    const dir = regenerableDir(entry);
+    if (dir) pruned.set(dir, (pruned.get(dir) ?? 0) + 1);
+    else wanted.push(entry);
+  }
+  result.skipped = entries.length - wanted.length;
+
+  if (wanted.length) log(`${dim('│')} copying ignored files from ${dim(sourceDir)}`);
 
   // node_modules and build output are in scope by design, so this can be tens
   // of thousands of files. A silent multi-minute pause reads as a hang, so keep
@@ -729,7 +781,7 @@ function seedIgnoredFiles(sourceDir, destinationDir) {
   const skipped = [];
   const skip = (reason) => { if (skipped.length < 100) skipped.push(reason); };
 
-  for (const entry of entries) {
+  for (const entry of wanted) {
     const sourcePath = resolve(sourceDir, entry);
     const destinationPath = resolve(destinationRoot, entry);
     if (!isWithin(sourceDir, sourcePath) || !isWithin(destinationRoot, destinationPath)) {
@@ -759,13 +811,20 @@ function seedIgnoredFiles(sourceDir, destinationDir) {
     }
     if (showProgress && Date.now() - lastTick > 200) {
       lastTick = Date.now();
-      stderr.write(`\r\x1b[K${dim('│')} ${result.copied} / ${entries.length}`);
+      stderr.write(`\r\x1b[K${dim('│')} ${result.copied} / ${wanted.length}`);
     }
   }
   if (showProgress) stderr.write('\r\x1b[K');
 
+  // Name what was left behind: an exclusion nobody can see is a silent
+  // surprise the first time a project keeps something real in `dist/`.
+  const names = [...pruned.entries()].sort((a, b) => b[1] - a[1]).map(([n]) => n);
   log(`${dim('│')} copied ${result.copied} ignored file(s)` +
-    (result.kept ? `, kept ${result.kept} the worktree already had` : ''));
+    (result.kept ? `, kept ${result.kept} the worktree already had` : '') +
+    (result.skipped
+      ? `, skipped ${result.skipped} in ` +
+        names.slice(0, 3).join(', ') + (names.length > 3 ? ', …' : '')
+      : ''));
   if (skipped.length) {
     warn(`could not copy ${skipped.length} ignored file(s), starting with ${skipped[0]}`);
   }

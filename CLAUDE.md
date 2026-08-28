@@ -20,7 +20,8 @@ missing along the way:
 3. For a new branch, use `origin/HEAD` as its base; for a PR, fetch its latest
    head into the local review ref.
 4. Reuse an existing worktree and fast-forward it when possible, else `gwq add`.
-5. Copy the ignored files the worktree lacks from the GHQ clone.
+5. Copy the ignored files the worktree lacks from the GHQ clone, minus the
+   dependency and build directories.
 6. `git submodule update --init --recursive` when `.gitmodules` exists.
 7. Print the path; `--init <shell>` emits a function so the *shell* cds.
 
@@ -217,15 +218,45 @@ Three properties, all required, all tested:
   user explicitly asked for may fail loudly, one that happens on every run may
   not.
 
-`node_modules` and build output are in scope on purpose — the decision was
-"copy everything ignored", not "guess which ignored files matter". That makes
-the operation slow enough to need narration: there is a counter on a TTY, and
-`copied N ignored file(s)` afterwards.
+### I9c. Dependency and build directories are excluded by name
 
-The sharp edge of that scope is the reuse path: filling in only what is missing
-in a worktree that already has its own `node_modules` interleaves two installs.
-Documented in the README rather than special-cased, because a denylist of
-"regenerable" directory names is exactly the guessing this decision rejected.
+The first draft copied **everything** ignored, on the principle that guessing
+which ignored files matter is not our business. Two measurements killed it: in
+the reporter's monorepo 394 of 514 ignored paths were under `node_modules`, and
+filling in only what is missing in a worktree that has its own install
+interleaves two dependency trees — worse than an empty one. A `.next` cache
+carries absolute paths and is wrong the moment it moves.
+
+So `REGENERABLE_DIRS` excludes a path whose **parent components** contain one of
+46 names. Only parents count: a file called `dist` is a file.
+
+There is no honest signal to use instead, and this was checked:
+
+- `git ls-files --others --ignored --exclude-standard --directory` collapses
+  wholly-ignored directories, but `.secrets/` — which holds the credential the
+  reporter needed — collapses exactly like `node_modules/`.
+- A size or entry-count budget answers differently depending on whether anyone
+  has run `npm install` lately, so the same repository behaves two ways.
+
+That leaves the name, which is a denylist, which is incomplete by construction.
+Two things keep it honest and both are tested: the list is reproduced verbatim
+in `--help`, and every run reports `skipped N in <dirs>`. An exclusion nobody
+can see is a silent surprise the first time a project keeps something real in
+`dist/`.
+
+The list is sorted, unique, and parsed out of the source by the test — the
+regression test for a hand-edit that adds a name without documenting it. Keep
+`REGENERABLE_DIRS` a plain array for that reason; the `Set` beside it is what
+the lookup uses.
+
+Deliberately **not** excluded: `.bundle`, `.idea`, `.vscode`. They are ignored
+config, not build output, and a project that needs `.bundle/config` needs it in
+every worktree.
+
+The pruning happens before any filesystem call, because git lists every single
+file inside `node_modules` and there can be hundreds of thousands of them.
+
+`gwqadd` carries the same list (its I25b), by copy rather than by dependency.
 
 `gwqadd` carries the same behaviour (its I25), sharing the implementation by
 copy rather than by dependency (I13 — zero runtime dependencies).
@@ -431,7 +462,7 @@ Not covered — run by hand:
 | Fork PR | `gwqpull <fork-pr-url>` | `pr-N` branch, "no upstream" warning |
 | Deleted head PR | `gwqpull <merged-pr-url>` | `pr-N` fallback with a note |
 | Ignored files | `gwqpull <repo> <branch>` | ignored config files copied without asking; ordinary untracked files excluded |
-| Ignored copy, big tree | a clone with `node_modules` installed | a counter moves, then `copied N ignored file(s)` |
+| Ignored copy, big tree | a clone with `node_modules` installed | `node_modules` is skipped and named in the summary |
 | Ignored files off | `gwqpull --no-copy-ignored-files <repo> <branch>` | nothing copied |
 | Submodules | `gwqpull <repo-with-submodules>` | submodules populated |
 | Dirty worktree | edit a file, re-run | warns, does not rewrite (I7) |

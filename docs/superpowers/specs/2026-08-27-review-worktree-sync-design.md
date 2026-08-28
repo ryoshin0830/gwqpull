@@ -4,8 +4,12 @@
 > the ignored-file copy is on by default, `--no-copy-ignored-files` turns it off,
 > and a copy failure warns instead of raising `E_WORKTREE`. The reason is in
 > CLAUDE.md I9b — a fix you have to remember a flag for did not fix anything for
-> the person who asked for it. Everything else in this document still describes
-> the shipped behaviour.
+> the person who asked for it.
+>
+> Requirement 6's scope narrowed with it: dependency and build directories
+> (`node_modules`, `.venv`, `dist`, …) are excluded by name, because copying them
+> is slow and a half-filled `node_modules` is worse than an empty one. See I9c.
+> Everything else in this document still describes the shipped behaviour.
 
 ## Goal
 
