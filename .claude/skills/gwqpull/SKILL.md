@@ -86,10 +86,12 @@ calling — or check `created` in the result and confirm with them.
 
 For a PR URL, normal runs fetch the latest PR head and fast-forward the existing
 review worktree when it is clean and has not diverged. Dirty or diverged review
-work is left intact with a warning. If the user explicitly wants ignored local
-configuration files such as `.env` copied from the GHQ clone, add
-`--copy-ignored-files`; it copies only missing ignored paths and leaves ordinary
-untracked files and existing destination files alone. A pre-existing local
+work is left intact with a warning. Ignored local configuration files such as
+`.env` are copied from the GHQ clone **by default**, so the worktree can run the
+project; only missing ignored paths are copied, and ordinary untracked files and
+existing destination files are left alone. Pass `--no-copy-ignored-files` if the
+user wants a worktree without them.  A copy that fails is a warning, so a
+non-zero `exitCode` never means "the copy failed". A pre-existing local
 fallback branch named `pr-N` that was not created by gwqpull is left untouched
 and reported as a conflict.
 
@@ -106,6 +108,9 @@ and reported as a conflict.
   "pr":            null,
   "created":       true,
   "isMainClone":   false,
+  "ignoredFiles":  { "copied": 6, "kept": 0, "skipped": 41932,
+                     "failed": 0, "error": null, "enabled": true,
+                     "heldFor": null },
   "cd":            false
 }
 ```
@@ -116,6 +121,23 @@ and reported as a conflict.
   clone, so `path == clone` and no worktree was made. Be careful there: changes
   land in the user's primary checkout.
 - `pr` — the PR number when a PR URL was given.
+- `ignoredFiles` — how many Git-ignored files (`.env`, credentials, local
+  config) were copied in from `clone`, how many the worktree already had and
+  kept, and how many were `skipped` for living in a dependency or build
+  directory (`node_modules`, `.venv`, `dist`, … — `gwqpull --help` lists all 46).
+  **The copy did its job iff `enabled` is true, `error` is null and `failed` is
+  0** — `enabled: false` means it never ran (turned off, or withheld for a fork
+  PR), whose counters are otherwise identical to a clone with nothing to copy.
+  It never affects `exitCode`, and in `--json` this payload is the only place
+  its trouble is reported, so check it rather than the exit code or stderr.
+  **The worktree has no `node_modules`** — run the project's install step there
+  before building or testing.
+  For a **fork PR** nothing is copied at all unless `--copy-ignored-files` is
+  passed: it is third-party code, and the copy would hand it the user's
+  credentials. `heldFor: "fork"` is how that shows up in the payload — tell the
+  user the worktree has no local configuration and why, and do not pass that
+  flag on their behalf. A PR whose `isCrossRepository` could not be read counts
+  as a fork here.
 
 Progress narrates on stderr, so parse stdout with `jq -r .path`. Tolerate
 unknown fields — the schema allows additive growth.

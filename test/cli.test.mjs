@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync, mkdirSync, existsSync, readdirSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync, mkdirSync, existsSync, readdirSync, realpathSync, symlinkSync, readlinkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,7 +19,9 @@ const SLUG = 'github.com/alice/api';
 let sandbox, ghqRoot, wtBase, originDir, shimDir, seedDir, prCommit1, prCommit2;
 
 const git = (cwd, ...args) => {
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  // The harness needs the same headroom the CLI does: the big-tree fixture's
+  // ignored-file listing is several MiB and spawnSync truncates at 1 MiB.
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 });
   if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr}`);
   return (r.stdout ?? '').trim();
 };
@@ -80,7 +82,7 @@ before(() => {
   write('ghq', `#!/bin/sh
 case "$1" in
   --version) echo "ghq version 1.6.1"; exit 0 ;;
-  root)      echo "${ghqRoot}"; exit 0 ;;
+  root)      echo "\${GWQPULL_TEST_GHQ_ROOT:-${ghqRoot}}"; exit 0 ;;
   list)
     # Two callers, and they want different things:
     #   \`list -e <owner/repo>\`     -> the slug, for host inference
@@ -90,7 +92,8 @@ case "$1" in
     want_path=0
     for a in "$@"; do [ "$a" = "-p" ] && want_path=1; done
     if [ -d "${ghqRoot}/${SLUG}" ] && [ "\${GWQGET_TEST_KNOWN:-1}" = "1" ]; then
-      if [ "$want_path" = "1" ]; then echo "${ghqRoot}/${SLUG}"; else echo "${SLUG}"; fi
+      root="\${GWQPULL_TEST_GHQ_ROOT:-${ghqRoot}}"
+      if [ "$want_path" = "1" ]; then echo "$root/${SLUG}"; else echo "${SLUG}"; fi
     fi
     exit 0 ;;
   get)
@@ -107,7 +110,13 @@ case "$1" in
   --version) echo "gh version 2.50.0"; exit 0 ;;
   pr)
     [ "$2" = "view" ] || exit 1
-    printf '%s\\n' '{"headRefName":"pr/source","isCrossRepository":false,"state":"OPEN","title":"Review PR"}'
+    if [ -n "$GWQPULL_TEST_FORK_MISSING" ]; then
+      printf '{"headRefName":"pr/source","state":"OPEN","title":"Review PR"}\\n'
+      exit 0
+    fi
+    fork=false
+    [ -n "$GWQPULL_TEST_FORK" ] && fork=true
+    printf '{"headRefName":"pr/source","isCrossRepository":%s,"state":"OPEN","title":"Review PR"}\\n' "$fork"
     exit 0 ;;
 esac
 exit 1
@@ -122,7 +131,7 @@ exit 1
 shift
 if [ "$1" = "-b" ]; then newbranch=1; branch="$2"; else newbranch=0; branch="$1"; fi
 slug=$(printf '%s' "$branch" | tr '/' '-')
-wt="${wtBase}/$slug"
+wt="\${GWQPULL_TEST_WTBASE:-${wtBase}}/$slug"
 if [ -e "$wt" ] && [ -n "$(ls -A "$wt" 2>/dev/null)" ]; then
   # gwq's real wording, including git's quoted fatal line — that is the line
   # the CLI prefers, so a shim that omitted it tested the wrong branch.
@@ -353,6 +362,39 @@ test('help documents default-branch and ignored-file behavior', () => {
   assert.equal(r.status, 0);
   assert.match(r.stdout, /origin\/HEAD/);
   assert.match(r.stdout, /--copy-ignored-files/);
+  assert.match(r.stdout, /--no-copy-ignored-files/);
+  // The exclusion list is only honest if it is written down where it is used.
+  assert.match(r.stdout, /node_modules/);
+  assert.match(r.stdout, /\.venv/);
+  assert.match(r.stdout, /\.terraform/);
+  // Both spellings belong in OPTIONS: a script author reads the table, not the
+  // prose, and --copy-ignored-files is there for scripts to be explicit with.
+  assert.match(r.stdout, /^\s+--copy-ignored-files\b/m);
+  assert.match(r.stdout, /^\s+--no-copy-ignored-files\b/m);
+  // Every documented command has to actually run.
+  for (const line of r.stdout.split('\n')) {
+    if (line.includes('ls-files') && line.includes('--ignored')) {
+      assert.match(line, /--exclude-standard/,
+        '`ls-files --ignored` without --exclude-standard is a fatal error');
+    }
+  }
+});
+
+test('every excluded directory name is listed in --help', () => {
+  const source = readFileSync(BIN, 'utf8');
+  const m = source.match(/const REGENERABLE_DIRS = \[([^\]]*)\]/);
+  assert.ok(m, 'REGENERABLE_DIRS not found in bin/gwqpull.mjs');
+  const names = m[1].split(',').map((x) => x.trim().replace(/^'|'$/g, '')).filter(Boolean);
+  assert.ok(names.length > 20, `only ${names.length} names parsed`);
+  assert.deepEqual([...names].sort(), names, 'REGENERABLE_DIRS is not sorted');
+  assert.equal(new Set(names).size, names.length, 'REGENERABLE_DIRS has duplicates');
+
+  // An exclusion nobody can read is a silent surprise the first time a project
+  // keeps something real in one of these. --help is where it has to be visible.
+  const help = run(['--help']).stdout;
+  for (const name of names) {
+    assert.ok(help.includes(name), `--help does not mention ${name}`);
+  }
 });
 
 test('a new branch starts from the default branch, not main clone HEAD', () => {
@@ -395,7 +437,22 @@ test('an existing PR worktree refreshes to the latest PR head', () => {
   assert.equal(git(second.path, 'rev-parse', 'HEAD'), prCommit2);
 });
 
-test('a dirty PR worktree is not fast-forwarded', () => {
+test('a PR worktree with local edits is not fast-forwarded', () => {
+  resetClone();
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit1);
+  const first = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42']));
+  writeFileSync(join(first.path, 'README.md'), '# edited during review\n');
+
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit2);
+  const second = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42']));
+  assert.equal(git(second.path, 'rev-parse', 'HEAD'), prCommit1);
+  assert.equal(readFileSync(join(second.path, 'README.md'), 'utf8'), '# edited during review\n');
+});
+
+// The gate looks at tracked changes only, because the ignored-file copy itself
+// creates untracked files in the worktree — see I9b. An untracked file is not at
+// risk: git refuses the ff on its own when the merge would overwrite one.
+test('an untracked file neither blocks the fast-forward nor is lost to it', () => {
   resetClone();
   git(originDir, 'update-ref', 'refs/pull/42/head', prCommit1);
   const first = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42']));
@@ -403,7 +460,7 @@ test('a dirty PR worktree is not fast-forwarded', () => {
 
   git(originDir, 'update-ref', 'refs/pull/42/head', prCommit2);
   const second = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42']));
-  assert.equal(git(second.path, 'rev-parse', 'HEAD'), prCommit1);
+  assert.equal(git(second.path, 'rev-parse', 'HEAD'), prCommit2, 'it should follow the PR head');
   assert.equal(readFileSync(join(second.path, 'review-notes.txt'), 'utf8'), 'keep this note\n');
 });
 
@@ -421,7 +478,7 @@ test('an unrelated existing pr-N branch is not changed by a PR URL', () => {
   assert.ok(!existsSync(join(wtBase, 'pr-42')), 'an unrelated PR branch must not get a review worktree');
 });
 
-test('--copy-ignored-files seeds missing ignored files without overwriting', () => {
+test('ignored files are seeded by default, without overwriting', () => {
   resetClone();
   out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
   const clone = join(ghqRoot, SLUG);
@@ -430,37 +487,384 @@ test('--copy-ignored-files seeds missing ignored files without overwriting', () 
   writeFileSync(join(clone, 'ignored-dir', 'nested.txt'), 'nested ignored\n');
   writeFileSync(join(clone, 'notes.txt'), 'ordinary untracked\n');
 
-  const j = out(run([
-    '--json', '-n', '--no-fetch', '--copy-ignored-files', 'alice/api', 'feat/login',
-  ]));
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
   assert.equal(readFileSync(join(j.path, '.env'), 'utf8'), 'API_URL=https://local.example\n');
   assert.equal(readFileSync(join(j.path, 'ignored-dir', 'nested.txt'), 'utf8'), 'nested ignored\n');
   assert.ok(!existsSync(join(j.path, 'notes.txt')), 'ordinary untracked files must stay out');
 
   writeFileSync(join(j.path, '.env'), 'API_URL=https://review.example\n');
-  out(run([
-    '--json', '-n', '--no-fetch', '--copy-ignored-files', 'alice/api', 'feat/login',
-  ]));
+  const again = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
   assert.equal(readFileSync(join(j.path, '.env'), 'utf8'), 'API_URL=https://review.example\n');
+  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 2, skipped: 0, failed: 0, error: null, enabled: true, heldFor: null });
 });
 
-test('--copy-ignored-files refuses symlinked destination parents', () => {
+test('dependency and build directories are skipped, config files are not', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, '.env'), 'API_URL=https://local.example\n');
+  mkdirSync(join(clone, 'ignored-dir'), { recursive: true });
+  writeFileSync(join(clone, 'ignored-dir', 'nested.txt'), 'nested ignored\n');
+  // The fixture's .gitignore only covers *.env and ignored-dir/; these have to
+  // be ignored too, or they would be plain untracked files and never in scope.
+  writeFileSync(join(clone, '.git', 'info', 'exclude'),
+    'node_modules/\n.venv/\ndist/\nweb/.next/\n');
+  for (const [d, f] of [
+    ['node_modules/pkg', 'index.js'],
+    ['.venv/lib', 'site.py'],
+    ['dist', 'bundle.js'],
+    ['web/.next/cache', 'chunk.js'],
+  ]) {
+    mkdirSync(join(clone, d), { recursive: true });
+    writeFileSync(join(clone, d, f), 'regenerable\n');
+  }
+
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  assert.equal(readFileSync(join(j.path, '.env'), 'utf8'), 'API_URL=https://local.example\n');
+  assert.equal(readFileSync(join(j.path, 'ignored-dir', 'nested.txt'), 'utf8'), 'nested ignored\n');
+  for (const p of ['node_modules', '.venv', 'dist', 'web/.next']) {
+    assert.ok(!existsSync(join(j.path, p)), `${p} must not be copied`);
+  }
+  assert.deepEqual(j.ignoredFiles, { copied: 2, kept: 0, skipped: 4, failed: 0, error: null, enabled: true, heldFor: null });
+});
+
+test('the skipped directories are named on stderr', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, '.git', 'info', 'exclude'), 'node_modules/\n');
+  mkdirSync(join(clone, 'node_modules', 'pkg'), { recursive: true });
+  writeFileSync(join(clone, 'node_modules', 'pkg', 'index.js'), 'regenerable\n');
+
+  const r = run(['--quiet', '-n', '--no-fetch', 'alice/api', 'feat/login']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /skipped 1/);
+  assert.match(r.stderr, /node_modules/);
+});
+
+// The listing is the central risk of taking node_modules into scope: git prints
+// every path in it, and spawnSync's default 1 MiB maxBuffer truncates that with
+// signal SIGTERM and error ENOBUFS — which landed in the "could not list"
+// warning and copied nothing at all, .env included, silently in --json.
+test('a listing far past the default maxBuffer still copies the config files', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'API_URL=https://local.example\n');
+  writeFileSync(join(clone, '.git', 'info', 'exclude'), 'node_modules/\n');
+  const deep = join(clone, 'node_modules',
+    Array.from({ length: 6 }, (_, i) => `pkg-with-a-fairly-long-directory-name-${i}`).join('/'));
+  mkdirSync(deep, { recursive: true });
+  for (let i = 0; i < 4200; i++) {
+    writeFileSync(join(deep, `module-file-with-a-long-name-${String(i).padStart(6, '0')}.js`), 'x');
+  }
+  const bytes = git(clone, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z').length;
+  assert.ok(bytes > 1048576, `fixture only produced ${bytes} bytes, under the 1 MiB default`);
+
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  assert.equal(j.ignoredFiles.error, null, 'the listing must not fail');
+  assert.equal(readFileSync(join(j.path, 'local.env'), 'utf8'), 'API_URL=https://local.example\n');
+  assert.equal(j.ignoredFiles.skipped, 4200);
+});
+
+test('the copy does not leave the worktree dirty for the next fast-forward', () => {
+  resetClone();
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit1);
+  // .gitignore is tracked, so it differs per branch: main ignores localconf/,
+  // the PR head predates that rule. The copied file therefore lands in the
+  // review worktree as an ordinary untracked file — gwqpull dirtying the tree
+  // itself. (`.git/info/exclude` would not do: it lives in the common git dir
+  // and every worktree shares it. And not a REGENERABLE_DIRS name either, since
+  // those are never copied and so could never dirty anything.)
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  // `ghq get` is a plain `git clone`, so the clone inherits no identity: the
+  // harness only configures seedDir. Without these two lines this test passes
+  // or fails with the developer's global user.email — and CI runs the suite
+  // only at publish time, so it would have failed there first.
+  git(clone, 'config', 'user.email', 'test@example.com');
+  git(clone, 'config', 'user.name', 'Test');
+  writeFileSync(join(clone, '.gitignore'), '*.env\nignored-dir/\nlocalconf/\n');
+  git(clone, 'add', '-A');
+  git(clone, 'commit', '-qm', 'ignore localconf on main only');
+  mkdirSync(join(clone, 'localconf'), { recursive: true });
+  writeFileSync(join(clone, 'localconf', 'app.conf'), 'local\n');
+
+  const first = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42']));
+  assert.ok(existsSync(join(first.path, 'localconf', 'app.conf')), 'the copy should have run');
+
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit2);
+  const second = run(['--json', '-n', 'https://github.com/alice/api/pull/42']);
+  const j = out(second);
+  assert.equal(git(j.path, 'rev-parse', 'HEAD'), prCommit2,
+    'the worktree must still follow the PR head after the copy');
+});
+
+test('a fork PR does not get the credentials unless asked', () => {
+  resetClone();
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit1);
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'SECRET=production\n');
+
+  const j = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42'],
+    { env: { GWQPULL_TEST_FORK: 'true' } }));
+  assert.ok(!existsSync(join(j.path, 'local.env')),
+    'a fork PR is third-party code — credentials must not be copied into it by default');
+
+  const forced = out(run(['--json', '-n', '--copy-ignored-files',
+    'https://github.com/alice/api/pull/42'], { env: { GWQPULL_TEST_FORK: 'true' } }));
+  assert.equal(readFileSync(join(forced.path, 'local.env'), 'utf8'), 'SECRET=production\n',
+    '--copy-ignored-files is the explicit override');
+});
+
+test('this repository\'s own worktrees are never copied', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'API_URL=https://local.example\n');
+  writeFileSync(join(clone, '.git', 'info', 'exclude'), '.worktrees/\n');
+  git(clone, 'worktree', 'add', '-q', '-b', 'inside', join(clone, '.worktrees', 'inside'));
+
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  assert.ok(existsSync(join(j.path, 'local.env')));
+  assert.ok(!existsSync(join(j.path, '.worktrees')),
+    'a worktree of this repository must not be copied into another worktree');
+});
+
+// `git worktree list` knows only the live worktrees. What sits beside them in
+// gwq's basedir — a `.bak-` moved aside by -f, a worktree whose .git file went
+// missing — is an ignored directory like any other, and a full checkout.
+test('a leftover beside the worktrees is not copied', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'SECRET=production\n');
+  writeFileSync(join(clone, '.git', 'info', 'exclude'), '.worktrees/\n');
+  const inside = { env: { GWQPULL_TEST_WTBASE: join(clone, '.worktrees') } };
+
+  const first = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login'], inside));
+  renameSync(first.path, `${first.path}.bak-20260828T120000Z`);
+  git(clone, 'worktree', 'prune');
+
+  const second = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'base/other'], inside));
+  assert.equal(readFileSync(join(second.path, 'local.env'), 'utf8'), 'SECRET=production\n');
+  assert.ok(!existsSync(join(second.path, '.worktrees')),
+    'a leftover checkout must not be copied into the new worktree');
+});
+
+test('--json distinguishes a copy that was turned off from one with nothing to do', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'API_URL=https://local.example\n');
+
+  const off = out(run([
+    '--json', '-n', '--no-fetch', '--no-copy-ignored-files', 'alice/api', 'feat/login',
+  ]));
+  assert.equal(off.ignoredFiles.enabled, false,
+    'an agent must not read "turned off" as "the .env is there"');
+
+  const on = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'base/other']));
+  assert.equal(on.ignoredFiles.enabled, true);
+});
+
+test('a fork PR reports the copy as not enabled', () => {
+  resetClone();
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit1);
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'SECRET=production\n');
+
+  const j = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42'],
+    { env: { GWQPULL_TEST_FORK: 'true' } }));
+  assert.equal(j.ignoredFiles.enabled, false,
+    'withheld for a fork PR is not the same as nothing to copy');
+});
+
+test('a withheld copy says why, and a disabled one says that instead', () => {
+  resetClone();
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit1);
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'SECRET=production\n');
+
+  const fork = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42'],
+    { env: { GWQPULL_TEST_FORK: 'true' } }));
+  assert.equal(fork.ignoredFiles.heldFor, 'fork');
+  assert.equal(fork.ignoredFiles.enabled, false);
+
+  const off = out(run([
+    '--json', '-n', '--no-fetch', '--no-copy-ignored-files', 'alice/api', 'base/other',
+  ]));
+  assert.equal(off.ignoredFiles.heldFor, null, 'turned off is not a fork hold');
+  assert.equal(off.ignoredFiles.enabled, false);
+
+  const on = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  assert.equal(on.ignoredFiles.heldFor, null);
+  assert.equal(on.ignoredFiles.enabled, true);
+});
+
+// The copy gate decides whether third-party code gets the user's credentials,
+// so an unreadable answer from `gh` has to count as a fork. The branch it picks
+// is a separate question and stays keyed on a positive answer.
+test('an unknown isCrossRepository withholds the copy but not the branch', () => {
+  resetClone();
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit1);
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'SECRET=production\n');
+
+  const j = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42'],
+    { env: { GWQPULL_TEST_FORK_MISSING: '1' } }));
+  assert.equal(j.ignoredFiles.heldFor, 'fork', 'unknown must fail closed');
+  assert.ok(!existsSync(join(j.path, 'local.env')));
+
+  // The branch side is unchanged: the fork path announces itself with the
+  // "no upstream" warning, and this run must not take it.
+  const again = run(['--quiet', '-n', 'https://github.com/alice/api/pull/42'],
+    { env: { GWQPULL_TEST_FORK_MISSING: '1' } });
+  assert.equal(again.status, 0, again.stderr);
+  assert.doesNotMatch(again.stderr, /no upstream is set/);
+});
+
+test('an ignored nested repository is copied, and said out loud', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, '.git', 'info', 'exclude'), 'sidecar/\n');
+  mkdirSync(join(clone, 'sidecar'), { recursive: true });
+  git(join(clone, 'sidecar'), 'init', '-q', '-b', 'main');
+  writeFileSync(join(clone, 'sidecar', 'note.txt'), 'vendored\n');
+
+  const r = run(['--quiet', '-n', '--no-fetch', 'alice/api', 'feat/login']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /nested repositor/i,
+    'git collapses it into one entry, so the counter cannot show its size');
+  assert.ok(existsSync(join(wtBase, 'feat-login', 'sidecar', 'note.txt')));
+});
+
+// The sandbox root is realpathed (see the traps above), so source and
+// destination always resolve the same way inside the suite — which is exactly
+// what hid this: a real `ghq.root` reached through a symlink prints an
+// unresolved path, while `git worktree list` and destinationRoot are resolved.
+// Both worktree guards then compare paths that can never match, and the
+// worktree being created gets copied into itself until the names run out.
+test('a symlinked ghq root does not make the worktree copy itself', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'SECRET=production\n');
+  writeFileSync(join(clone, '.git', 'info', 'exclude'), '.worktrees/\n');
+
+  const linkRoot = join(sandbox, 'ghq-link');
+  rmSync(linkRoot, { force: true });
+  symlinkSync(ghqRoot, linkRoot);
+  const viaLink = {
+    env: {
+      GWQPULL_TEST_GHQ_ROOT: linkRoot,
+      GWQPULL_TEST_WTBASE: join(clone, '.worktrees'),
+    },
+  };
+
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login'], viaLink));
+  assert.equal(readFileSync(join(j.path, 'local.env'), 'utf8'), 'SECRET=production\n');
+  assert.ok(!existsSync(join(j.path, '.worktrees')),
+    'the worktree must not be copied into itself through the symlinked root');
+  assert.equal(j.ignoredFiles.failed, 0);
+});
+
+test('a relative symlink stays relative instead of pointing at the clone', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  mkdirSync(join(clone, 'ignored-dir', 'real'), { recursive: true });
+  mkdirSync(join(clone, 'ignored-dir', 'bin'), { recursive: true });
+  writeFileSync(join(clone, 'ignored-dir', 'real', 'tsc'), 'tsc\n');
+  symlinkSync(join('..', 'real', 'tsc'), join(clone, 'ignored-dir', 'bin', 'tsc'));
+
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  assert.equal(j.ignoredFiles.failed, 0);
+  assert.equal(readlinkSync(join(j.path, 'ignored-dir', 'bin', 'tsc')), join('..', 'real', 'tsc'),
+    'cpSync rewrites relative symlinks to absolute paths unless verbatimSymlinks is set');
+});
+
+test('the failure count is the real one, not the first hundred', (t) => {
+  if (process.getuid?.() === 0) return t.skip('chmod 000 does not restrain root');
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  mkdirSync(join(clone, 'ignored-dir'), { recursive: true });
+  const files = [];
+  for (let i = 0; i < 150; i++) {
+    const f = join(clone, 'ignored-dir', `f${String(i).padStart(3, '0')}.txt`);
+    writeFileSync(f, 'secret\n');
+    chmodSync(f, 0o000);
+    files.push(f);
+  }
+  try {
+    const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+    assert.equal(j.ignoredFiles.failed, 150);
+    assert.equal(j.ignoredFiles.copied, 0);
+  } finally {
+    for (const f of files) chmodSync(f, 0o644);
+  }
+});
+
+test('--no-copy-ignored-files leaves the worktree without them', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, '.env'), 'API_URL=https://local.example\n');
+
+  const j = out(run([
+    '--json', '-n', '--no-fetch', '--no-copy-ignored-files', 'alice/api', 'feat/login',
+  ]));
+  assert.ok(!existsSync(join(j.path, '.env')), '--no-copy-ignored-files must copy nothing');
+});
+
+test('--copy-ignored-files and --no-copy-ignored-files together is a contradiction', () => {
+  const r = run([
+    '--json', '-n', '--copy-ignored-files', '--no-copy-ignored-files', 'alice/api',
+  ]);
+  assert.equal(r.status, 1);
+  const err = jsonLine(r.stderr).error;
+  assert.equal(err.code, 'E_VALIDATION');
+  // Not parseArgs rejecting an unknown flag: both spellings must be known.
+  assert.match(err.message, /--copy-ignored-files/);
+  assert.match(err.message, /--no-copy-ignored-files/);
+});
+
+test('--json reports what the copy did', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, '.env'), 'API_URL=https://local.example\n');
+
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  assert.deepEqual(j.ignoredFiles, { copied: 1, kept: 0, skipped: 0, failed: 0, error: null, enabled: true, heldFor: null });
+});
+
+test('a symlinked destination parent is skipped, not followed or fatal', () => {
   resetClone();
   out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
   const clone = join(ghqRoot, SLUG);
   mkdirSync(join(clone, 'ignored-dir'), { recursive: true });
   writeFileSync(join(clone, 'ignored-dir', 'nested.txt'), 'must stay inside\n');
 
-  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  // Create the worktree with the copy off, so the symlink can take the place
+  // the copy would otherwise have filled in on this very first run.
+  const j = out(run([
+    '--json', '-n', '--no-fetch', '--no-copy-ignored-files', 'alice/api', 'feat/login',
+  ]));
   const outside = join(sandbox, 'outside');
   mkdirSync(outside);
   symlinkSync(outside, join(j.path, 'ignored-dir'));
 
-  const r = run([
-    '--json', '-n', '--no-fetch', '--copy-ignored-files', 'alice/api', 'feat/login',
-  ]);
-  assert.equal(r.status, 1);
-  assert.equal(jsonLine(r.stderr).error.code, 'E_WORKTREE');
+  const again = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  assert.equal(again.path, j.path, 'the worktree is still reported, not an error');
+  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 0, skipped: 0, failed: 1, error: null, enabled: true, heldFor: null },
+    'the entry is skipped, not copied');
   assert.ok(!existsSync(join(outside, 'nested.txt')), 'copy must not follow a destination symlink');
 });
 

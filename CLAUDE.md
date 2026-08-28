@@ -20,8 +20,8 @@ missing along the way:
 3. For a new branch, use `origin/HEAD` as its base; for a PR, fetch its latest
    head into the local review ref.
 4. Reuse an existing worktree and fast-forward it when possible, else `gwq add`.
-5. Optionally seed missing ignored files from the GHQ clone with
-   `--copy-ignored-files`.
+5. Copy the ignored files the worktree lacks from the GHQ clone, minus the
+   dependency and build directories.
 6. `git submodule update --init --recursive` when `.gitmodules` exists.
 7. Print the path; `--init <shell>` emits a function so the *shell* cds.
 
@@ -154,10 +154,27 @@ their own history.
 That is where in-progress work lives. An existing worktree gets
 `git merge --ff-only origin/<branch>` for ordinary branches, or the latest
 `refs/gwqpull/pull/<number>/head` for PR URLs. Newly created worktrees receive
-the same fast-forward step after `gwq add`. A divergence or a dirty tree
-produces a **warning and a successful exit**, never a rewrite and never a hard
+the same fast-forward step after `gwq add`. A divergence or local changes
+produce a **warning and a successful exit**, never a rewrite and never a hard
 failure. Losing someone's uncommitted work is worse than any convenience this
 tool offers.
+
+**The gate reads `--untracked-files=no`, and that is deliberate.** It used to be
+`--untracked-files=all`, which stopped working the moment the ignored-file copy
+became the default (I9b): `.gitignore` is tracked, so it differs per branch, and
+a file the clone ignores lands in a worktree whose branch predates that rule as
+an ordinary untracked file. gwqpull thus dirtied the tree itself and then refused
+to follow the PR head for the rest of that worktree's life — under a `✓`.
+
+Untracked files are not at risk from the relaxation, which was verified against
+git rather than assumed: `merge --ff-only` refuses on its own, and leaves the
+file alone, when the merge would overwrite an untracked file; an unrelated
+untracked file does not block it. Tracked modifications still do.
+
+The test for this needs a **tracked** `.gitignore` difference between the clone's
+checkout and the worktree's branch. `.git/info/exclude` cannot express it: it
+lives in the common git dir, so every worktree of the repository shares it — the
+first version of that test passed against the bug for exactly this reason.
 
 ### I8. `git worktree list` includes the main working tree
 
@@ -170,6 +187,32 @@ paths and on macOS a `/var/...` ghq root arrives back as `/private/var/...`.
 An earlier version returned `isMainClone: false` here because it assumed only
 linked worktrees were listed. The `rev-parse --abbrev-ref HEAD` branch below it
 is a fallback for states git's porcelain does not cover, not the primary path.
+
+**The general rule, which this invariant used to state only for its own call
+site: a path from git and a path we assembled ourselves are never compared
+without `realpathSync` on both sides.** `ghq list -p` does not resolve (I6b), so
+a `ghq.root` reached through a symlink hands us `/t/link/ghq/…` while git and
+`destinationRoot` say `/t/store/ghq/…`. Review found `seedIgnoredFiles()`
+comparing exactly those two spellings: every `isWithin` answered "no", **both**
+worktree guards turned off at once, and the worktree being created was copied
+into itself — measured at 50 levels of nesting and 987-character paths before
+the filesystem refused, `{skipped: 0}` all the way. On Linux the same run
+aborted the process through an uncaught `std::filesystem` error, so `--json`
+emitted nothing and the shell function read the empty stdout as success. The
+copy now resolves its source at the entry.
+
+And the corollary, which review asked to have written down next to the rule:
+**resolve for comparisons, print what the caller handed us.** `clone` in the
+`--json` payload is `ghq list -p`'s answer, so the copy's own progress line and
+its error message use that spelling too; a single run showing two spellings of
+one directory reads as two directories. The resolved form never leaves
+`seedIgnoredFiles()`.
+
+The suite could not have caught it: `sandbox = realpathSync(mkdtempSync(...))`
+is the right fix for the macOS `/var` trap, and it also makes source and
+destination resolve identically in every test. The regression test therefore
+teaches the `ghq` shim to print an unresolved path
+(`GWQPULL_TEST_GHQ_ROOT`) rather than un-resolving the sandbox.
 
 ### I9. PR resolution has three shapes, not one
 
@@ -187,13 +230,186 @@ instead of being advanced silently.
 The fork case must warn that no upstream is set. Collapsing these into "just
 use headRefName" breaks two of the three.
 
-### I9b. Copy ignored files only when explicitly requested
+### I9b. Ignored files are copied by default, and cannot fail the run
 
-`--copy-ignored-files` enumerates ignored, untracked paths using the GHQ clone's
-Git rules. It copies only paths missing from the destination, creates parent
-directories as needed, and never overwrites or deletes destination files.
-Ordinary untracked files are deliberately excluded. The option is independent
-of `--no-fetch` and never prompts.
+A worktree gets what git tracks and nothing else, so it starts with no `.env`,
+no credentials and no local config — unable to run the project it is a checkout
+of. `seedIgnoredFiles()` enumerates ignored, untracked paths using the GHQ
+clone's Git rules and copies them into the worktree. It is **on by default**;
+`--no-copy-ignored-files` turns it off and `--copy-ignored-files` is accepted so
+a script can be explicit. Both together is `E_VALIDATION`. Ordinary untracked
+files are deliberately excluded, and the copy is independent of `--no-fetch` and
+never prompts.
+
+It shipped opt-in in 0.1.7 and that was the wrong default: the user who asked
+for the feature hit the same empty worktree again on the next repository,
+because the fix was a flag they had to remember. 0.2.0 flipped it.
+
+Four properties, all required, all tested:
+
+- **Missing-only, never destructive.** A path the destination already has is
+  counted as kept and left alone, so a review-specific `.env` survives and
+  re-running is a no-op. Nothing is overwritten or deleted.
+- **The write cannot leave the destination.** The list comes from the
+  filesystem, so every entry is checked lexically (`isWithin`) *and* against
+  symlinked parents (`hasSymlinkInPath`) before mkdir and again after — mkdir
+  can follow a link that appeared in between. A rejected entry is skipped.
+- **It never blocks.** Every failure — unreadable source, a symlinked parent, a
+  full disk — warns and carries on. A worktree without its `.env` is worse than
+  one with it, but a worktree that was never reported is worse than both. This
+  replaced the `die('E_WORKTREE', …)` the opt-in version used: a copy that the
+  user explicitly asked for may fail loudly, one that happens on every run may
+  not.
+- **It reports its own trouble.** `ignoredFiles` carries `failed`, `error`,
+  `enabled` and `heldFor` for exactly that reason — see I11. Without them
+  `{copied:0,kept:0,skipped:0}` is "no ignored files", "the listing died",
+  "turned off" and "withheld for a fork PR" all at once, and `warn()` is silent
+  in `--json`.
+
+  Both extra fields came out of review, one round apart, and both for the same
+  reason: a path that returns a copy result without saying so is invisible to
+  `--json`. `enabled` covers "it never ran", whose counters were byte-identical
+  to a successful copy with nothing to do. `heldFor` says *why* — `"fork"`, or
+  null when the flag turned it off — because those want different reactions: the
+  fork case is a refusal to hand credentials to third-party code, which SKILL.md
+  tells agents not to override.
+
+  The fork gate itself reads `isCrossRepository !== false`, not `=== true`. Two
+  questions share that field: which branch to use is a feature decision and
+  needs a positive answer, while whether third-party code gets the user's `.env`
+  is a security decision. An unreadable answer therefore counts as a fork — a
+  wrong hold costs one flag, a wrong pass costs the keys.
+
+**A fork PR is the one place the default flips.** `isCrossRepository` means the
+worktree is a checkout of third-party code, and the review procedure *is*
+`npm install && npm test` — so the copy would put `.env`, `.npmrc` and
+service-account keys in front of whatever a postinstall script decides to do.
+Nothing is copied there unless `--copy-ignored-files` says so explicitly, and
+the warning names the flag. On by default is right for your own repositories and
+wrong for someone else's code; SKILL.md tells agents not to pass that flag on
+the user's behalf.
+
+`cpSync` runs with `verbatimSymlinks: true`. Its default resolves a symlink
+before copying, which turns `.secrets/bin/key -> ../real/key` into an absolute
+path back into the clone — a worktree quietly wired to another checkout. The
+example used to be `node_modules/.bin/tsc`, which I9c makes unreachable.
+
+### I9c. Dependency and build directories are excluded by name
+
+The first draft copied **everything** ignored, on the principle that guessing
+which ignored files matter is not our business. Two measurements killed it: in
+the reporter's monorepo 394 of 514 ignored paths were under `node_modules`, and
+filling in only what is missing in a worktree that has its own install
+interleaves two dependency trees — worse than an empty one. A `.next` cache
+carries absolute paths and is wrong the moment it moves.
+
+So `REGENERABLE_DIRS` excludes a path whose **parent components** contain one of
+46 names, at any depth. Only parents count: a file called `dist` is a file.
+
+**This repository's own worktrees are excluded too, and that one is not a
+guess.** With gwq's basedir inside the clone, every worktree is an ignored
+directory of the repository, and git reports a wholly-ignored directory as one
+indivisible entry — so worktrees copy each other, a level deeper on every run
+(measured in gwqadd: 4 → 12 → 28 files, nesting 15 components deep, stopped only
+by cpSync's own "cannot copy to a subdirectory of self"). `ownWorktrees()` reads
+`git worktree list --porcelain`.
+
+**The worktree list alone is not enough**, which review found in gwqadd and is
+fixed here too. git knows only the *live* worktrees; a `<path>.bak-<timestamp>`
+moved aside under `-f` (I10), or a worktree whose `.git` file went missing, is an
+ordinary ignored directory and a full checkout. So `dirname(destinationRoot)` —
+**the directory the destination sits in** — is pruned wholesale, guarded by
+`samePath(holder, dir)` for a basedir at the repository root. That is one level,
+not gwq's basedir: with a nesting naming template a leftover higher up is still
+copied, which needs the template to have changed under an existing worktree, and
+pruning the topmost ancestor instead would eat a real config directory whenever
+the basedir sits inside one. See gwqadd's I25b for the measurement.
+
+gwq *does* report its basedir — `gwq config get worktree.basedir`, verified on
+v0.1.1 — and reaching for it would still not help: the value is unexpanded, it
+is the configured basedir rather than where this worktree went, it costs another
+gwq start-up per run, and the leftovers in question sit beside the destination
+anyway. gwqadd's G5 records this; the note here used to say the interface did
+not exist, which review disproved with one command. The direction of
+`isWithin(p, w)` in that loop looks backwards and is not: `worktrees` contains
+the main working tree, so the "obvious fix" prunes every entry and copies
+nothing. Keep the comment.
+
+`skipped N` counts **entries** — one file under `node_modules`, but one whole
+directory where git stops at a repository boundary. The unit is stable on
+purpose: reporting the count is what keeps the denylist honest.
+
+A denylist name in the middle of a real path takes the file with it —
+`config/tmp/app.conf` goes with the rest of `tmp`. There is no allowlist and no
+config file for that: nothing here can tell a kept file from a build artefact,
+and the run names the directories it skipped so the user can copy it by hand.
+`--help` and the README say so rather than leaving it to be discovered.
+
+An ignored **nested repository** is one entry of unbounded size, because git
+stops at the boundary: the progress counter cannot move inside it. It is copied
+whole, `.git` included, with a warning naming it — not excluded, since a
+`.secrets` that happens to be a repository is still the credential this exists
+for.
+
+There is no honest signal to use instead, and this was checked:
+
+- `git ls-files --others --ignored --exclude-standard --directory` collapses
+  wholly-ignored directories, but `.secrets/` — which holds the credential the
+  reporter needed — collapses exactly like `node_modules/`.
+- A size or entry-count budget answers differently depending on whether anyone
+  has run `npm install` lately, so the same repository behaves two ways.
+
+That leaves the name, which is a denylist, which is incomplete by construction.
+Two things keep it honest and both are tested: the list is reproduced verbatim
+in `--help`, and every run reports `skipped N in <dirs>`. An exclusion nobody
+can see is a silent surprise the first time a project keeps something real in
+`dist/`.
+
+The list is sorted, unique, and parsed out of the source by the test — the
+regression test for a hand-edit that adds a name without documenting it. Keep
+`REGENERABLE_DIRS` a plain array for that reason; the `Set` beside it is what
+the lookup uses.
+
+Deliberately **not** excluded: `.bundle`, `.idea`, `.vscode`. They are ignored
+config, not build output, and a project that needs `.bundle/config` needs it in
+every worktree.
+
+The pruning happens before any filesystem call, because git lists every single
+file inside `node_modules` and there can be hundreds of thousands of them.
+
+`gwqadd` carries the same list (its I25b), by copy rather than by dependency.
+
+`gwqadd` carries the same behaviour (its I25), sharing the implementation by
+copy rather than by dependency (I13 — zero runtime dependencies).
+
+### I9d. The listing must never be truncated
+
+`spawnSync`'s default `maxBuffer` is 1 MiB, and `git ls-files --others --ignored
+--exclude-standard -z` is bounded by the **total length of the path names**, so
+any clone that has had `npm install` run in it goes past it. Measured:
+
+| ignored entries | `-z` bytes | before the fix |
+| --- | --- | --- |
+| 3,002 | 876 KB | `.env` lands |
+| 8,002 | 2.3 MB | `status:null signal:SIGTERM error:ENOBUFS`, **nothing copied** |
+
+A bare Next.js app (`next react react-dom typescript eslint vitest`) measured
+21,420 entries / 1.26 MB, so it was already over. Truncation surfaced as
+`status !== 0`, which fell into the "could not list" warning — silent in
+`--json`, so the whole feature disappeared without a trace, `.env` included, and
+0.1.7's `die` had at least been loud about it. `git()` therefore passes
+`maxBuffer: 512 * 1024 * 1024` for every call.
+
+**I9c does not save this.** Pruning happens after git returns, so the listing
+dies first; excluding `node_modules` by name makes the failure *quieter*, not
+less likely.
+
+The test builds a fixture whose listing exceeds 1 MiB on purpose and asserts the
+config file still arrives. The harness's own `git()` helper needed the same
+`maxBuffer` to measure that fixture, which is how loudly this fails.
+
+The listing failure now names its reason (`ENOBUFS`, a signal, or the exit
+code); "could not list" alone was indistinguishable from an empty result.
 
 ### I10. Collisions are moved, never deleted
 
@@ -245,9 +461,22 @@ the branch a second time.
   "pr":            <number> | null,
   "created":       true | false,
   "isMainClone":   true | false,
+  "ignoredFiles":  { "copied": <n>, "kept": <n>, "skipped": <n>,
+                     "failed": <n>, "error": "<message>" | null,
+                     "enabled": true | false, "heldFor": "fork" | null },
   "cd":            true | false
 }
 ```
+
+`ignoredFiles` is the only report the copy gets: it never touches the exit code,
+and `warn()` is silent in `--json`. The copy did its job iff `enabled` is true,
+`error` is null and `failed` is 0; `heldFor` says why it did not run.
+`{copied:0,kept:0,skipped:0}` on its own says nothing — it is equally a
+repository with no ignored files and a listing that died (I9d).
+
+Every entry git listed lands in exactly one of `copied`, `kept`, `failed` and
+`skipped` — including a source that vanished between the listing and the copy,
+which used to `continue` into none of them.
 
 Error (stderr, exit ≠ 0):
 
@@ -362,10 +591,23 @@ main-clone case, the I10 collision paths (both with and without `-f`, asserting
 the stray file survives inside the backup), and the I1/I3 stdout contract.
 The suite also covers new branches starting from `origin/HEAD` when the main
 clone is on another branch, PR worktree refresh after a new head commit, and
-opt-in ignored-file seeding with missing-only preservation.
+default-on ignored-file seeding — missing-only preservation, the `--no-copy-
+ignored-files` opt-out, the flag contradiction, and a symlinked destination
+parent being skipped rather than followed or fatal.
+
+The symlink test creates its worktree with `--no-copy-ignored-files` on purpose:
+now that the copy is the default, the first run would otherwise fill in the very
+directory the test needs to replace with a symlink.
 
 Two traps for anyone adding tests:
 
+- **A clone made by the `ghq get` shim has no git identity.** It is a plain
+  `git clone`; only `seedDir` is configured. A test that commits inside the
+  clone must set `user.email` and `user.name` on it, or it passes or fails with
+  whatever the developer has globally — and since CI runs the suite only at
+  publish time, that failure would land on the release. Verified with
+  `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null npm test`, which is
+  the cheap way to check hermeticity.
 - **Realpath the sandbox root.** macOS `$TMPDIR` is `/var/...` symlinked to
   `/private/var/...`, git reports the resolved form, and unresolved
   expectations will never match.
@@ -389,7 +631,16 @@ Not covered — run by hand:
 | PR re-run | push another commit to the PR, run the same command | existing worktree fast-forwards when clean |
 | Fork PR | `gwqpull <fork-pr-url>` | `pr-N` branch, "no upstream" warning |
 | Deleted head PR | `gwqpull <merged-pr-url>` | `pr-N` fallback with a note |
-| Ignored files | `gwqpull --copy-ignored-files <repo> <branch>` | ignored config files copied; ordinary untracked files excluded |
+| Ignored files | `gwqpull <repo> <branch>` | ignored config files copied without asking; ordinary untracked files excluded |
+| Ignored copy, big tree | a clone with `node_modules` installed | `node_modules` is skipped and named in the summary |
+| Ignored files off | `gwqpull --no-copy-ignored-files <repo> <branch>` | nothing copied |
+| Ignored copy, huge listing | a clone with `npm install` run in it | the config files still arrive; `ignoredFiles.error` is null (I9d) |
+| Fork PR copy | `gwqpull <fork-pr-url>` | nothing copied, and the warning names `--copy-ignored-files` |
+| Fork PR copy, forced | add `--copy-ignored-files` | copied |
+| Ignored copy, leftover beside the worktrees | `-f` a collision, then re-run | the `.bak-` is not copied into the new worktree |
+| Ignored copy, global excludes | `core.excludesFile` matching a local file | it is copied — `--exclude-standard` includes it |
+| Ignored copy, nested repository | an ignored directory that is itself a git repo | copied whole with a warning naming it |
+| Fork PR, unreadable `gh` output | a `gh` that omits `isCrossRepository` | the copy is withheld; the branch is unaffected |
 | Submodules | `gwqpull <repo-with-submodules>` | submodules populated |
 | Dirty worktree | edit a file, re-run | warns, does not rewrite (I7) |
 | Diverged branch | commit locally, re-run | warns, does not rewrite (I7) |
