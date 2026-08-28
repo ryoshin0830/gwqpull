@@ -1,5 +1,12 @@
 # Review Worktree Sync Design
 
+> **Superseded in part (0.2.0).** Requirement 5's "It is opt-in" no longer holds:
+> the ignored-file copy is on by default, `--no-copy-ignored-files` turns it off,
+> and a copy failure warns instead of raising `E_WORKTREE`. The reason is in
+> CLAUDE.md I9b — a fix you have to remember a flag for did not fix anything for
+> the person who asked for it. Everything else in this document still describes
+> the shipped behaviour.
+
 ## Goal
 
 Make `gwqpull` reliable for repeated code review: new local branches start at the repository's default branch, pull-request worktrees follow the latest PR head, and an explicit option can seed missing Git-ignored environment files from the existing GHQ clone.

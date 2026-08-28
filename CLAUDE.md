@@ -20,8 +20,7 @@ missing along the way:
 3. For a new branch, use `origin/HEAD` as its base; for a PR, fetch its latest
    head into the local review ref.
 4. Reuse an existing worktree and fast-forward it when possible, else `gwq add`.
-5. Optionally seed missing ignored files from the GHQ clone with
-   `--copy-ignored-files`.
+5. Copy the ignored files the worktree lacks from the GHQ clone.
 6. `git submodule update --init --recursive` when `.gitmodules` exists.
 7. Print the path; `--init <shell>` emits a function so the *shell* cds.
 
@@ -187,13 +186,49 @@ instead of being advanced silently.
 The fork case must warn that no upstream is set. Collapsing these into "just
 use headRefName" breaks two of the three.
 
-### I9b. Copy ignored files only when explicitly requested
+### I9b. Ignored files are copied by default, and cannot fail the run
 
-`--copy-ignored-files` enumerates ignored, untracked paths using the GHQ clone's
-Git rules. It copies only paths missing from the destination, creates parent
-directories as needed, and never overwrites or deletes destination files.
-Ordinary untracked files are deliberately excluded. The option is independent
-of `--no-fetch` and never prompts.
+A worktree gets what git tracks and nothing else, so it starts with no `.env`,
+no credentials and no local config — unable to run the project it is a checkout
+of. `seedIgnoredFiles()` enumerates ignored, untracked paths using the GHQ
+clone's Git rules and copies them into the worktree. It is **on by default**;
+`--no-copy-ignored-files` turns it off and `--copy-ignored-files` is accepted so
+a script can be explicit. Both together is `E_VALIDATION`. Ordinary untracked
+files are deliberately excluded, and the copy is independent of `--no-fetch` and
+never prompts.
+
+It shipped opt-in in 0.1.7 and that was the wrong default: the user who asked
+for the feature hit the same empty worktree again on the next repository,
+because the fix was a flag they had to remember. 0.2.0 flipped it.
+
+Three properties, all required, all tested:
+
+- **Missing-only, never destructive.** A path the destination already has is
+  counted as kept and left alone, so a review-specific `.env` survives and
+  re-running is a no-op. Nothing is overwritten or deleted.
+- **The write cannot leave the destination.** The list comes from the
+  filesystem, so every entry is checked lexically (`isWithin`) *and* against
+  symlinked parents (`hasSymlinkInPath`) before mkdir and again after — mkdir
+  can follow a link that appeared in between. A rejected entry is skipped.
+- **It never blocks.** Every failure — unreadable source, a symlinked parent, a
+  full disk — warns and carries on. A worktree without its `.env` is worse than
+  one with it, but a worktree that was never reported is worse than both. This
+  replaced the `die('E_WORKTREE', …)` the opt-in version used: a copy that the
+  user explicitly asked for may fail loudly, one that happens on every run may
+  not.
+
+`node_modules` and build output are in scope on purpose — the decision was
+"copy everything ignored", not "guess which ignored files matter". That makes
+the operation slow enough to need narration: there is a counter on a TTY, and
+`copied N ignored file(s)` afterwards.
+
+The sharp edge of that scope is the reuse path: filling in only what is missing
+in a worktree that already has its own `node_modules` interleaves two installs.
+Documented in the README rather than special-cased, because a denylist of
+"regenerable" directory names is exactly the guessing this decision rejected.
+
+`gwqadd` carries the same behaviour (its I25), sharing the implementation by
+copy rather than by dependency (I13 — zero runtime dependencies).
 
 ### I10. Collisions are moved, never deleted
 
@@ -362,7 +397,13 @@ main-clone case, the I10 collision paths (both with and without `-f`, asserting
 the stray file survives inside the backup), and the I1/I3 stdout contract.
 The suite also covers new branches starting from `origin/HEAD` when the main
 clone is on another branch, PR worktree refresh after a new head commit, and
-opt-in ignored-file seeding with missing-only preservation.
+default-on ignored-file seeding — missing-only preservation, the `--no-copy-
+ignored-files` opt-out, the flag contradiction, and a symlinked destination
+parent being skipped rather than followed or fatal.
+
+The symlink test creates its worktree with `--no-copy-ignored-files` on purpose:
+now that the copy is the default, the first run would otherwise fill in the very
+directory the test needs to replace with a symlink.
 
 Two traps for anyone adding tests:
 
@@ -389,7 +430,9 @@ Not covered — run by hand:
 | PR re-run | push another commit to the PR, run the same command | existing worktree fast-forwards when clean |
 | Fork PR | `gwqpull <fork-pr-url>` | `pr-N` branch, "no upstream" warning |
 | Deleted head PR | `gwqpull <merged-pr-url>` | `pr-N` fallback with a note |
-| Ignored files | `gwqpull --copy-ignored-files <repo> <branch>` | ignored config files copied; ordinary untracked files excluded |
+| Ignored files | `gwqpull <repo> <branch>` | ignored config files copied without asking; ordinary untracked files excluded |
+| Ignored copy, big tree | a clone with `node_modules` installed | a counter moves, then `copied N ignored file(s)` |
+| Ignored files off | `gwqpull --no-copy-ignored-files <repo> <branch>` | nothing copied |
 | Submodules | `gwqpull <repo-with-submodules>` | submodules populated |
 | Dirty worktree | edit a file, re-run | warns, does not rewrite (I7) |
 | Diverged branch | commit locally, re-run | warns, does not rewrite (I7) |

@@ -353,6 +353,7 @@ test('help documents default-branch and ignored-file behavior', () => {
   assert.equal(r.status, 0);
   assert.match(r.stdout, /origin\/HEAD/);
   assert.match(r.stdout, /--copy-ignored-files/);
+  assert.match(r.stdout, /--no-copy-ignored-files/);
 });
 
 test('a new branch starts from the default branch, not main clone HEAD', () => {
@@ -421,7 +422,7 @@ test('an unrelated existing pr-N branch is not changed by a PR URL', () => {
   assert.ok(!existsSync(join(wtBase, 'pr-42')), 'an unrelated PR branch must not get a review worktree');
 });
 
-test('--copy-ignored-files seeds missing ignored files without overwriting', () => {
+test('ignored files are seeded by default, without overwriting', () => {
   resetClone();
   out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
   const clone = join(ghqRoot, SLUG);
@@ -430,37 +431,70 @@ test('--copy-ignored-files seeds missing ignored files without overwriting', () 
   writeFileSync(join(clone, 'ignored-dir', 'nested.txt'), 'nested ignored\n');
   writeFileSync(join(clone, 'notes.txt'), 'ordinary untracked\n');
 
-  const j = out(run([
-    '--json', '-n', '--no-fetch', '--copy-ignored-files', 'alice/api', 'feat/login',
-  ]));
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
   assert.equal(readFileSync(join(j.path, '.env'), 'utf8'), 'API_URL=https://local.example\n');
   assert.equal(readFileSync(join(j.path, 'ignored-dir', 'nested.txt'), 'utf8'), 'nested ignored\n');
   assert.ok(!existsSync(join(j.path, 'notes.txt')), 'ordinary untracked files must stay out');
 
   writeFileSync(join(j.path, '.env'), 'API_URL=https://review.example\n');
-  out(run([
-    '--json', '-n', '--no-fetch', '--copy-ignored-files', 'alice/api', 'feat/login',
-  ]));
+  const again = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
   assert.equal(readFileSync(join(j.path, '.env'), 'utf8'), 'API_URL=https://review.example\n');
+  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 2 });
 });
 
-test('--copy-ignored-files refuses symlinked destination parents', () => {
+test('--no-copy-ignored-files leaves the worktree without them', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, '.env'), 'API_URL=https://local.example\n');
+
+  const j = out(run([
+    '--json', '-n', '--no-fetch', '--no-copy-ignored-files', 'alice/api', 'feat/login',
+  ]));
+  assert.ok(!existsSync(join(j.path, '.env')), '--no-copy-ignored-files must copy nothing');
+});
+
+test('--copy-ignored-files and --no-copy-ignored-files together is a contradiction', () => {
+  const r = run([
+    '--json', '-n', '--copy-ignored-files', '--no-copy-ignored-files', 'alice/api',
+  ]);
+  assert.equal(r.status, 1);
+  const err = jsonLine(r.stderr).error;
+  assert.equal(err.code, 'E_VALIDATION');
+  // Not parseArgs rejecting an unknown flag: both spellings must be known.
+  assert.match(err.message, /--copy-ignored-files/);
+  assert.match(err.message, /--no-copy-ignored-files/);
+});
+
+test('--json reports what the copy did', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, '.env'), 'API_URL=https://local.example\n');
+
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  assert.deepEqual(j.ignoredFiles, { copied: 1, kept: 0 });
+});
+
+test('a symlinked destination parent is skipped, not followed or fatal', () => {
   resetClone();
   out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
   const clone = join(ghqRoot, SLUG);
   mkdirSync(join(clone, 'ignored-dir'), { recursive: true });
   writeFileSync(join(clone, 'ignored-dir', 'nested.txt'), 'must stay inside\n');
 
-  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  // Create the worktree with the copy off, so the symlink can take the place
+  // the copy would otherwise have filled in on this very first run.
+  const j = out(run([
+    '--json', '-n', '--no-fetch', '--no-copy-ignored-files', 'alice/api', 'feat/login',
+  ]));
   const outside = join(sandbox, 'outside');
   mkdirSync(outside);
   symlinkSync(outside, join(j.path, 'ignored-dir'));
 
-  const r = run([
-    '--json', '-n', '--no-fetch', '--copy-ignored-files', 'alice/api', 'feat/login',
-  ]);
-  assert.equal(r.status, 1);
-  assert.equal(jsonLine(r.stderr).error.code, 'E_WORKTREE');
+  const again = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
+  assert.equal(again.path, j.path, 'the worktree is still reported, not an error');
+  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 0 }, 'the entry is skipped, not copied');
   assert.ok(!existsSync(join(outside, 'nested.txt')), 'copy must not follow a destination symlink');
 });
 

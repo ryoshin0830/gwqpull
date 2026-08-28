@@ -1,6 +1,6 @@
 {
   "name": "gwqpull",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "Clone with ghq, add a gwq worktree, and cd into it — in one shot.",
   "type": "module",
   "bin": {

@@ -85,9 +85,8 @@ Omit the branch and fzf offers every local and origin branch.
    has checked out. A PR uses its latest head commit instead.
 4. **Land on a worktree.** Reuse an existing one and fast-forward it when
    possible, else `gwq add` it and fast-forward it to the selected source.
-5. **Seed local configuration (optional).** With `--copy-ignored-files`, copy
-   missing Git-ignored files from the GHQ clone; ordinary untracked files are
-   excluded.
+5. **Seed local configuration.** Copy the Git-ignored files the worktree does
+   not have yet from the GHQ clone; ordinary untracked files are excluded.
 6. **Initialise submodules** when the tree has any — `git worktree add` does not.
 7. **Hand the path back** so the shell can `cd` there.
 
@@ -105,8 +104,8 @@ the branch and the worktree already existed.
   dirty tree is a warning, not a rewrite.
 - A fallback `pr-N` branch is updated only when it was created and associated
   by `gwqpull`; an unrelated local `pr-N` branch fails with an actionable error.
-- `--copy-ignored-files` never overwrites an existing destination file and
-  never deletes anything. It is a one-way, opt-in seed for local configuration.
+- The ignored-file copy never overwrites an existing destination file and never
+  deletes anything, and a failure there is a warning rather than a failed run.
 - A colliding directory is only touched with `-f`, and then it is **moved** to
   `<path>.bak-<timestamp>`, never deleted.
 
@@ -122,7 +121,7 @@ gwqpull [options] <repo|URL|PR-URL> [branch]
 | `--cmd <name>` | function name emitted by `--init` (default: `gwqpull`) |
 | `--no-fetch` | skip `git fetch` and the ff-only catch-up |
 | `--no-submodules` | skip `git submodule update --init --recursive` |
-| `--copy-ignored-files` | copy missing Git-ignored files from the GHQ clone |
+| `--no-copy-ignored-files` | do not copy the clone's Git-ignored files across |
 | `-f`, `--force` | move a colliding worktree directory aside instead of failing |
 | `-n`, `--no-cd` | do the work and report the path, but do not move the shell |
 | `--json` | stdout = 1-line JSON |
@@ -147,17 +146,31 @@ name was not created by `gwqpull`, the command stops instead of changing it.
 
 ### Local environment files
 
-Some projects keep required development settings in files ignored by Git, such
-as `.env` or files under `config/local/`. To seed those files into a review
-worktree, opt in explicitly:
+A worktree gets everything Git tracks and nothing it does not — no `.env`, no
+credentials, no `config/local/`, so nothing that would let the project run. They
+are copied over from the GHQ clone, by default:
 
 ```console
-$ gwqpull --copy-ignored-files https://github.com/cli/cli/pull/9421
+$ gwqpull https://github.com/cli/cli/pull/9421
+│ copying ignored files from /Users/you/ghq/github.com/cli/cli
+│ copied 37 ignored file(s)
 ```
 
-The files are copied from the existing GHQ clone to the same relative paths in
-the worktree. Existing files in the worktree are kept, so a review-specific
-environment file is not overwritten. Ordinary untracked files are not copied.
+Everything `git ls-files --others --ignored` reports is in scope, `node_modules`
+and build output included, so a big tree takes a moment — there is a counter
+while it runs. Ordinary untracked files are never copied.
+
+Existing files in the worktree are kept, so a review-specific environment file
+is never overwritten and re-running is a no-op. A copy that fails is a warning,
+never a failed run: the worktree is reported either way.
+
+One consequence worth knowing: on a worktree that already has its own
+`node_modules`, filling in only what is missing mixes two installs. That is
+harmless for `.env` and awkward for a dependency tree, so reinstall there if
+anything looks strange — or pass `--no-copy-ignored-files` for that run.
+
+`--no-copy-ignored-files` turns it off. `--copy-ignored-files` is the default and
+is accepted so a script can say so out loud.
 
 ## For scripts and AI agents
 
@@ -167,7 +180,9 @@ $ gwqpull --json -n cli/cli trunk
 ```
 
 `created` says whether this run made the worktree; `isMainClone` says the branch
-was already checked out in the main clone, so no worktree was needed.
+was already checked out in the main clone, so no worktree was needed;
+`ignoredFiles` reports how many Git-ignored files were copied in from the clone
+and how many the worktree already had and kept.
 
 Progress narrates on stderr, so stdout stays parseable. Errors go to stderr as
 JSON with stdout empty:

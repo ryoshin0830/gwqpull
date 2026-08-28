@@ -86,10 +86,12 @@ calling — or check `created` in the result and confirm with them.
 
 For a PR URL, normal runs fetch the latest PR head and fast-forward the existing
 review worktree when it is clean and has not diverged. Dirty or diverged review
-work is left intact with a warning. If the user explicitly wants ignored local
-configuration files such as `.env` copied from the GHQ clone, add
-`--copy-ignored-files`; it copies only missing ignored paths and leaves ordinary
-untracked files and existing destination files alone. A pre-existing local
+work is left intact with a warning. Ignored local configuration files such as
+`.env` are copied from the GHQ clone **by default**, so the worktree can run the
+project; only missing ignored paths are copied, and ordinary untracked files and
+existing destination files are left alone. Pass `--no-copy-ignored-files` if the
+user wants a worktree without them.  A copy that fails is a warning, so a
+non-zero `exitCode` never means "the copy failed". A pre-existing local
 fallback branch named `pr-N` that was not created by gwqpull is left untouched
 and reported as a conflict.
 
@@ -106,6 +108,7 @@ and reported as a conflict.
   "pr":            null,
   "created":       true,
   "isMainClone":   false,
+  "ignoredFiles":  { "copied": 37, "kept": 0 },
   "cd":            false
 }
 ```
@@ -116,6 +119,9 @@ and reported as a conflict.
   clone, so `path == clone` and no worktree was made. Be careful there: changes
   land in the user's primary checkout.
 - `pr` — the PR number when a PR URL was given.
+- `ignoredFiles` — how many Git-ignored files (`.env`, credentials, local
+  config) were copied in from `clone`, and how many the worktree already had and
+  kept.
 
 Progress narrates on stderr, so parse stdout with `jq -r .path`. Tolerate
 unknown fields — the schema allows additive growth.
