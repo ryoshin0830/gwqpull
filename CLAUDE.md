@@ -188,6 +188,25 @@ An earlier version returned `isMainClone: false` here because it assumed only
 linked worktrees were listed. The `rev-parse --abbrev-ref HEAD` branch below it
 is a fallback for states git's porcelain does not cover, not the primary path.
 
+**The general rule, which this invariant used to state only for its own call
+site: a path from git and a path we assembled ourselves are never compared
+without `realpathSync` on both sides.** `ghq list -p` does not resolve (I6b), so
+a `ghq.root` reached through a symlink hands us `/t/link/ghq/…` while git and
+`destinationRoot` say `/t/store/ghq/…`. Review found `seedIgnoredFiles()`
+comparing exactly those two spellings: every `isWithin` answered "no", **both**
+worktree guards turned off at once, and the worktree being created was copied
+into itself — measured at 50 levels of nesting and 987-character paths before
+the filesystem refused, `{skipped: 0}` all the way. On Linux the same run
+aborted the process through an uncaught `std::filesystem` error, so `--json`
+emitted nothing and the shell function read the empty stdout as success. The
+copy now resolves its source at the entry.
+
+The suite could not have caught it: `sandbox = realpathSync(mkdtempSync(...))`
+is the right fix for the macOS `/var` trap, and it also makes source and
+destination resolve identically in every test. The regression test therefore
+teaches the `ghq` shim to print an unresolved path
+(`GWQPULL_TEST_GHQ_ROOT`) rather than un-resolving the sandbox.
+
 ### I9. PR resolution has three shapes, not one
 
 - **same-repo PR** → check out `headRefName`

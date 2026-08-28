@@ -82,7 +82,7 @@ before(() => {
   write('ghq', `#!/bin/sh
 case "$1" in
   --version) echo "ghq version 1.6.1"; exit 0 ;;
-  root)      echo "${ghqRoot}"; exit 0 ;;
+  root)      echo "\${GWQPULL_TEST_GHQ_ROOT:-${ghqRoot}}"; exit 0 ;;
   list)
     # Two callers, and they want different things:
     #   \`list -e <owner/repo>\`     -> the slug, for host inference
@@ -92,7 +92,8 @@ case "$1" in
     want_path=0
     for a in "$@"; do [ "$a" = "-p" ] && want_path=1; done
     if [ -d "${ghqRoot}/${SLUG}" ] && [ "\${GWQGET_TEST_KNOWN:-1}" = "1" ]; then
-      if [ "$want_path" = "1" ]; then echo "${ghqRoot}/${SLUG}"; else echo "${SLUG}"; fi
+      root="\${GWQPULL_TEST_GHQ_ROOT:-${ghqRoot}}"
+      if [ "$want_path" = "1" ]; then echo "$root/${SLUG}"; else echo "${SLUG}"; fi
     fi
     exit 0 ;;
   get)
@@ -741,6 +742,36 @@ test('an ignored nested repository is copied, and said out loud', () => {
   assert.match(r.stderr, /nested repositor/i,
     'git collapses it into one entry, so the counter cannot show its size');
   assert.ok(existsSync(join(wtBase, 'feat-login', 'sidecar', 'note.txt')));
+});
+
+// The sandbox root is realpathed (see the traps above), so source and
+// destination always resolve the same way inside the suite — which is exactly
+// what hid this: a real `ghq.root` reached through a symlink prints an
+// unresolved path, while `git worktree list` and destinationRoot are resolved.
+// Both worktree guards then compare paths that can never match, and the
+// worktree being created gets copied into itself until the names run out.
+test('a symlinked ghq root does not make the worktree copy itself', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'SECRET=production\n');
+  writeFileSync(join(clone, '.git', 'info', 'exclude'), '.worktrees/\n');
+
+  const linkRoot = join(sandbox, 'ghq-link');
+  rmSync(linkRoot, { force: true });
+  symlinkSync(ghqRoot, linkRoot);
+  const viaLink = {
+    env: {
+      GWQPULL_TEST_GHQ_ROOT: linkRoot,
+      GWQPULL_TEST_WTBASE: join(clone, '.worktrees'),
+    },
+  };
+
+  const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login'], viaLink));
+  assert.equal(readFileSync(join(j.path, 'local.env'), 'utf8'), 'SECRET=production\n');
+  assert.ok(!existsSync(join(j.path, '.worktrees')),
+    'the worktree must not be copied into itself through the symlinked root');
+  assert.equal(j.ignoredFiles.failed, 0);
 });
 
 test('a relative symlink stays relative instead of pointing at the clone', () => {
