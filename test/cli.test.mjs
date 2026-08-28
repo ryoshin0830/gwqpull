@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync, mkdirSync, existsSync, readdirSync, realpathSync, symlinkSync, readlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync, mkdirSync, existsSync, readdirSync, realpathSync, symlinkSync, readlinkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -126,7 +126,7 @@ exit 1
 shift
 if [ "$1" = "-b" ]; then newbranch=1; branch="$2"; else newbranch=0; branch="$1"; fi
 slug=$(printf '%s' "$branch" | tr '/' '-')
-wt="${wtBase}/$slug"
+wt="\${GWQPULL_TEST_WTBASE:-${wtBase}}/$slug"
 if [ -e "$wt" ] && [ -n "$(ls -A "$wt" 2>/dev/null)" ]; then
   # gwq's real wording, including git's quoted fatal line — that is the line
   # the CLI prefers, so a shim that omitted it tested the wrong branch.
@@ -490,7 +490,7 @@ test('ignored files are seeded by default, without overwriting', () => {
   writeFileSync(join(j.path, '.env'), 'API_URL=https://review.example\n');
   const again = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
   assert.equal(readFileSync(join(j.path, '.env'), 'utf8'), 'API_URL=https://review.example\n');
-  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 2, skipped: 0, failed: 0, error: null });
+  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 2, skipped: 0, failed: 0, error: null, enabled: true });
 });
 
 test('dependency and build directories are skipped, config files are not', () => {
@@ -520,7 +520,7 @@ test('dependency and build directories are skipped, config files are not', () =>
   for (const p of ['node_modules', '.venv', 'dist', 'web/.next']) {
     assert.ok(!existsSync(join(j.path, p)), `${p} must not be copied`);
   }
-  assert.deepEqual(j.ignoredFiles, { copied: 2, kept: 0, skipped: 4, failed: 0, error: null });
+  assert.deepEqual(j.ignoredFiles, { copied: 2, kept: 0, skipped: 4, failed: 0, error: null, enabled: true });
 });
 
 test('the skipped directories are named on stderr', () => {
@@ -621,6 +621,56 @@ test('this repository\'s own worktrees are never copied', () => {
     'a worktree of this repository must not be copied into another worktree');
 });
 
+// `git worktree list` knows only the live worktrees. What sits beside them in
+// gwq's basedir — a `.bak-` moved aside by -f, a worktree whose .git file went
+// missing — is an ignored directory like any other, and a full checkout.
+test('a leftover beside the worktrees is not copied', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'SECRET=production\n');
+  writeFileSync(join(clone, '.git', 'info', 'exclude'), '.worktrees/\n');
+  const inside = { env: { GWQPULL_TEST_WTBASE: join(clone, '.worktrees') } };
+
+  const first = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login'], inside));
+  renameSync(first.path, `${first.path}.bak-20260828T120000Z`);
+  git(clone, 'worktree', 'prune');
+
+  const second = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'base/other'], inside));
+  assert.equal(readFileSync(join(second.path, 'local.env'), 'utf8'), 'SECRET=production\n');
+  assert.ok(!existsSync(join(second.path, '.worktrees')),
+    'a leftover checkout must not be copied into the new worktree');
+});
+
+test('--json distinguishes a copy that was turned off from one with nothing to do', () => {
+  resetClone();
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'API_URL=https://local.example\n');
+
+  const off = out(run([
+    '--json', '-n', '--no-fetch', '--no-copy-ignored-files', 'alice/api', 'feat/login',
+  ]));
+  assert.equal(off.ignoredFiles.enabled, false,
+    'an agent must not read "turned off" as "the .env is there"');
+
+  const on = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'base/other']));
+  assert.equal(on.ignoredFiles.enabled, true);
+});
+
+test('a fork PR reports the copy as not enabled', () => {
+  resetClone();
+  git(originDir, 'update-ref', 'refs/pull/42/head', prCommit1);
+  out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
+  const clone = join(ghqRoot, SLUG);
+  writeFileSync(join(clone, 'local.env'), 'SECRET=production\n');
+
+  const j = out(run(['--json', '-n', 'https://github.com/alice/api/pull/42'],
+    { env: { GWQPULL_TEST_FORK: 'true' } }));
+  assert.equal(j.ignoredFiles.enabled, false,
+    'withheld for a fork PR is not the same as nothing to copy');
+});
+
 test('a relative symlink stays relative instead of pointing at the clone', () => {
   resetClone();
   out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
@@ -636,7 +686,8 @@ test('a relative symlink stays relative instead of pointing at the clone', () =>
     'cpSync rewrites relative symlinks to absolute paths unless verbatimSymlinks is set');
 });
 
-test('the failure count is the real one, not the first hundred', () => {
+test('the failure count is the real one, not the first hundred', (t) => {
+  if (process.getuid?.() === 0) return t.skip('chmod 000 does not restrain root');
   resetClone();
   out(run(['--json', '-n', '--no-fetch', 'alice/api', 'main']));
   const clone = join(ghqRoot, SLUG);
@@ -688,7 +739,7 @@ test('--json reports what the copy did', () => {
   writeFileSync(join(clone, '.env'), 'API_URL=https://local.example\n');
 
   const j = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
-  assert.deepEqual(j.ignoredFiles, { copied: 1, kept: 0, skipped: 0, failed: 0, error: null });
+  assert.deepEqual(j.ignoredFiles, { copied: 1, kept: 0, skipped: 0, failed: 0, error: null, enabled: true });
 });
 
 test('a symlinked destination parent is skipped, not followed or fatal', () => {
@@ -709,7 +760,7 @@ test('a symlinked destination parent is skipped, not followed or fatal', () => {
 
   const again = out(run(['--json', '-n', '--no-fetch', 'alice/api', 'feat/login']));
   assert.equal(again.path, j.path, 'the worktree is still reported, not an error');
-  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 0, skipped: 0, failed: 1, error: null },
+  assert.deepEqual(again.ignoredFiles, { copied: 0, kept: 0, skipped: 0, failed: 1, error: null, enabled: true },
     'the entry is skipped, not copied');
   assert.ok(!existsSync(join(outside, 'nested.txt')), 'copy must not follow a destination symlink');
 });

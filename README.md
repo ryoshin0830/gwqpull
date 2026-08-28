@@ -182,9 +182,16 @@ Ordinary untracked files are never copied either.
 
 The worktrees of this repository are skipped as well — a reading of `git
 worktree list` rather than a guess, and it matters when gwq's basedir lives
-inside the clone, where worktrees would otherwise copy each other. Relative
-symlinks stay relative, so a copied `node_modules/.bin/tsc` cannot end up
-pointing back into the clone.
+inside the clone, where worktrees would otherwise copy each other. So is
+everything else sitting in that directory: a `.bak-` moved aside by `-f`, or a
+worktree whose `.git` file went missing, each of which is another full checkout.
+
+Relative symlinks stay relative, so a copied `.secrets/bin/key -> ../real/key`
+cannot end up pointing back into the clone.
+
+"Ignored" means whatever `git ls-files --others --ignored --exclude-standard`
+reports, so `.git/info/exclude` and your machine's global `core.excludesFile`
+count too.
 
 **A fork PR is the exception to the default.** It is a checkout of third-party
 code that you are about to run — `npm install && npm test` *is* the review — so
@@ -200,7 +207,9 @@ Existing files in the worktree are kept, so a review-specific environment file
 is never overwritten and re-running is a no-op. A copy that fails is a warning,
 never a failed run: the worktree is reported either way. In `--json` that
 trouble is reported in the payload instead — the copy did its job when
-`ignoredFiles.error` is null and `ignoredFiles.failed` is 0.
+`ignoredFiles.enabled` is true, `ignoredFiles.error` is null and
+`ignoredFiles.failed` is 0. `enabled` is false when the copy never ran: turned
+off, or withheld for a fork PR.
 
 The worktree therefore has no `node_modules`: run the project's install step
 there before building or testing.

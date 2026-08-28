@@ -108,7 +108,8 @@ and reported as a conflict.
   "pr":            null,
   "created":       true,
   "isMainClone":   false,
-  "ignoredFiles":  { "copied": 6, "kept": 0, "skipped": 41932 },
+  "ignoredFiles":  { "copied": 6, "kept": 0, "skipped": 41932,
+                     "failed": 0, "error": null, "enabled": true },
   "cd":            false
 }
 ```
@@ -123,9 +124,11 @@ and reported as a conflict.
   config) were copied in from `clone`, how many the worktree already had and
   kept, and how many were `skipped` for living in a dependency or build
   directory (`node_modules`, `.venv`, `dist`, … — `gwqpull --help` lists all 46).
-  **The copy did its job iff `error` is null and `failed` is 0** — it never
-  affects `exitCode`, and in `--json` this is the only place its trouble is
-  reported, so check it rather than the exit code or stderr.
+  **The copy did its job iff `enabled` is true, `error` is null and `failed` is
+  0** — `enabled: false` means it never ran (turned off, or withheld for a fork
+  PR), whose counters are otherwise identical to a clone with nothing to copy.
+  It never affects `exitCode`, and in `--json` this payload is the only place
+  its trouble is reported, so check it rather than the exit code or stderr.
   **The worktree has no `node_modules`** — run the project's install step there
   before building or testing.
   For a **fork PR** nothing is copied at all unless `--copy-ignored-files` is
