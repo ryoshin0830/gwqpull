@@ -837,7 +837,10 @@ function seedIgnoredFiles(sourceDirIn, destinationDir) {
   // resolved paths in `worktree list`, so a source that arrives unresolved makes
   // every path comparison in here compare two spellings of the same place and
   // answer "no" — which turns **both** worktree guards off at once and lets the
-  // worktree being created be copied into itself. `ghq list -p` does not resolve (I6b), so a symlinked ghq.root did exactly that.
+  // worktree being created be copied into itself. `ghq list -p` does not
+  // resolve (I6b), so a symlinked ghq.root did exactly that. The resolved form
+  // stays inside this function: comparisons need it, output does not, and one
+  // run printing two spellings of one directory reads as two directories.
   let sourceDir = sourceDirIn;
   try {
     sourceDir = realpathSync(sourceDirIn);
@@ -871,7 +874,7 @@ function seedIgnoredFiles(sourceDirIn, destinationDir) {
     // look like a repository with nothing to copy.
     const why = r.error?.code
       ?? (r.signal ? `killed by ${r.signal}` : `git exited ${r.status}`);
-    result.error = `could not list the ignored files in ${sourceDir} (${why})`;
+    result.error = `could not list the ignored files in ${sourceDirIn} (${why})`;
     warn(result.error);
     return result;
   }
@@ -926,7 +929,8 @@ function seedIgnoredFiles(sourceDirIn, destinationDir) {
   }
   result.skipped = entries.length - wanted.length;
 
-  if (wanted.length) log(`${dim('│')} copying ignored files from ${dim(sourceDir)}`);
+  // Printed as we were handed it, so this agrees with `clone` in --json.
+  if (wanted.length) log(`${dim('│')} copying ignored files from ${dim(sourceDirIn)}`);
 
   // node_modules and build output are in scope by design, so this can be tens
   // of thousands of files. A silent multi-minute pause reads as a hang, so keep

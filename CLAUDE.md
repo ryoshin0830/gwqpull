@@ -201,6 +201,13 @@ aborted the process through an uncaught `std::filesystem` error, so `--json`
 emitted nothing and the shell function read the empty stdout as success. The
 copy now resolves its source at the entry.
 
+And the corollary, which review asked to have written down next to the rule:
+**resolve for comparisons, print what the caller handed us.** `clone` in the
+`--json` payload is `ghq list -p`'s answer, so the copy's own progress line and
+its error message use that spelling too; a single run showing two spellings of
+one directory reads as two directories. The resolved form never leaves
+`seedIgnoredFiles()`.
+
 The suite could not have caught it: `sandbox = realpathSync(mkdtempSync(...))`
 is the right fix for the macOS `/var` trap, and it also makes source and
 destination resolve identically in every test. The regression test therefore
